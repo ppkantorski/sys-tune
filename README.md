@@ -1,5 +1,5 @@
 # sys-tune
-## Background audio player for the Nintendo switch + Tesla overlay
+## Background audio player for the Nintendo switch + Ultrahand Overlay / Tesla Menu
 
 ## Installation
 1. Download the release zip from [here](https://github.com/HookedBehemoth/sys-tune/releases/latest)
