@@ -1,17 +1,28 @@
 #include "gui_browser.hpp"
+#include "gui_main.hpp"
 
 #include "config/config.hpp"
+#include "play_context.hpp"
+#include "symbol.hpp"
 #include "tune.h"
+#include "get_funcs.hpp"    // ult::isDirectory, ult::DirCloser
+
+#include <memory>
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
+#include <unordered_map>
 
 namespace {
 
-    bool ListItemTextCompare(const tsl::elm::ListItem *_lhs, const tsl::elm::ListItem *_rhs) {
-        return strcasecmp(_lhs->getText().c_str(), _rhs->getText().c_str()) < 0;
-    };
+    bool ListItemTextCompare(const tsl::elm::ListItem *a, const tsl::elm::ListItem *b) {
+        return strcasecmp(a->getText().c_str(), b->getText().c_str()) < 0;
+    }
 
-    bool StringTextCompare(const std::string& _lhs, const std::string& _rhs) {
-        return strcasecmp(_lhs.c_str(), _rhs.c_str()) < 0;
-    };
+    bool StringTextCompare(const std::string &a, const std::string &b) {
+        return strcasecmp(a.c_str(), b.c_str()) < 0;
+    }
 
     ALWAYS_INLINE bool EndsWith(const char *name, const char *ext) {
         return strcasecmp(name + std::strlen(name) - std::strlen(ext), ext) == 0;
@@ -39,237 +50,950 @@ namespace {
 
     constexpr const char *const base_path = "/music/";
 
-    char path_buffer[FS_MAX_PATH];
+// =============================================================================
+// Lightweight tag reader — title + artist only, no art.
+// Self-contained copy in this TU's anonymous namespace.
+// =============================================================================
 
-}
+    static u32 ta_be32(const u8 *p) {
+        return ((u32)p[0]<<24)|((u32)p[1]<<16)|((u32)p[2]<<8)|(u32)p[3];
+    }
+    static u32 ta_le32(const u8 *p) {
+        return (u32)p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24);
+    }
+    static u32 ta_syncsafe(const u8 *p) {
+        return ((u32)(p[0]&0x7F)<<21)|((u32)(p[1]&0x7F)<<14)|
+               ((u32)(p[2]&0x7F)<<7) |(u32)(p[3]&0x7F);
+    }
+    static bool ta_keycmp(const char *a, const char *b) {
+        for (; *a && *b; ++a, ++b)
+            if ((*a | 0x20) != (*b | 0x20)) return false;
+        return *a == '\0' && *b == '\0';
+    }
 
+    struct TitleArtist { std::string title; std::string artist; };
 
-BrowserGui::BrowserGui()
-    : m_fs(), has_music(), cwd("/") {
-    this->m_list = new tsl::elm::List();
+    static std::string ta_decodeString(const u8 *payload, size_t size) {
+        if (size < 1) return {};
+        u8 enc = payload[0];
+        const u8 *s = payload + 1;
+        size_t    n = size   - 1;
 
-    /* Open sd card filesystem. */
-    Result rc = fsOpenSdCardFileSystem(&this->m_fs);
-    if (R_SUCCEEDED(rc)) {
-        /* Check if base path /music/ exists. */
-        FsDir dir;
-        std::strcpy(this->cwd, base_path);
-        if (R_SUCCEEDED(fsFsOpenDirectory(&this->m_fs, this->cwd, FsDirOpenMode_ReadFiles, &dir))) {
-            this->has_music = true;
-            fsDirClose(&dir);
-        } else {
-            this->cwd[1] = '\0';
+        if (enc == 0 || enc == 3) {
+            size_t len = 0;
+            while (len < n && s[len]) len++;
+            return std::string(reinterpret_cast<const char*>(s), len);
         }
-        this->scanCwd();
-    } else {
-        this->m_list->addItem(new tsl::elm::CategoryHeader("Couldn't open SdCard"));
+
+        bool be = (enc == 2);
+        size_t i = 0;
+        if (enc == 1 && n >= 2) {
+            if      (s[0]==0xFE && s[1]==0xFF) { be=true;  i=2; }
+            else if (s[0]==0xFF && s[1]==0xFE) { be=false; i=2; }
+        }
+        std::string r;
+        r.reserve(n / 2);
+        for (; i+1 < n; i+=2) {
+            u16 cp = be ? (u16)((s[i]<<8)|s[i+1]) : (u16)(s[i]|(s[i+1]<<8));
+            if (!cp) break;
+            if      (cp < 0x80)  { r += (char)cp; }
+            else if (cp < 0x800) { r += (char)(0xC0|(cp>>6));
+                                   r += (char)(0x80|(cp&0x3F)); }
+            else                 { r += (char)(0xE0|(cp>>12));
+                                   r += (char)(0x80|((cp>>6)&0x3F));
+                                   r += (char)(0x80|(cp&0x3F)); }
+        }
+        return r;
+    }
+
+    static TitleArtist ta_readID3(FILE *f) {
+        fseek(f, 0, SEEK_SET);
+        u8 hdr[10];
+        if (fread(hdr,1,10,f)!=10 || memcmp(hdr,"ID3",3)!=0) return {};
+        u8  ver     = hdr[3];
+        u8  flags   = hdr[5];
+        u32 tagSize = ta_syncsafe(hdr+6);
+        if (tagSize > 16*1024*1024) return {};
+        // Cap read to 64 KB — title/artist frames are always near the front;
+        // only embedded album art pushes tags beyond this, and we don't need it.
+        constexpr u32 kMaxTagRead = 64 * 1024;
+        if (tagSize > kMaxTagRead) tagSize = kMaxTagRead;
+
+        size_t total = 10 + tagSize;
+        auto buf = std::make_unique<u8[]>(total);
+        memcpy(buf.get(), hdr, 10);
+        fseek(f, 10, SEEK_SET);
+        if (fread(buf.get()+10, 1, tagSize, f) != tagSize) return {};
+
+        TitleArtist ta;
+        const u8 *data = buf.get();
+        size_t pos = 10;
+        if ((flags & 0x40) && ver >= 3) {
+            if (pos+4 > total) return ta;
+            u32 exSz = (ver==4) ? ta_syncsafe(data+pos) : ta_be32(data+pos);
+            pos += exSz;
+        }
+        size_t end = std::min((size_t)(10+tagSize), total);
+
+        while (pos+6 < end) {
+            if (ver == 2) {
+                if (pos+6 > end) break;
+                const u8 *fh = data+pos; pos+=6;
+                if (!fh[0]) break;
+                u32 sz = ((u32)fh[3]<<16)|((u32)fh[4]<<8)|(u32)fh[5];
+                if (pos+sz > total) break;
+                if (ta.title.empty()  && memcmp(fh,"TT2",3)==0)
+                    ta.title  = ta_decodeString(data+pos, sz);
+                if (ta.artist.empty() && memcmp(fh,"TP1",3)==0)
+                    ta.artist = ta_decodeString(data+pos, sz);
+                pos += sz;
+            } else {
+                if (pos+10 > end) break;
+                const u8 *fh = data+pos; pos+=10;
+                if (!fh[0]) break;
+                u32 sz = (ver==4) ? ta_syncsafe(fh+4) : ta_be32(fh+4);
+                if (!sz || pos+sz > total) { pos+=sz; continue; }
+                if (ta.title.empty()  && memcmp(fh,"TIT2",4)==0)
+                    ta.title  = ta_decodeString(data+pos, sz);
+                if (ta.artist.empty() && memcmp(fh,"TPE1",4)==0)
+                    ta.artist = ta_decodeString(data+pos, sz);
+                pos += sz;
+            }
+            if (!ta.title.empty() && !ta.artist.empty()) break;
+        }
+        return ta;
+    }
+
+    static void ta_readVorbisComment(FILE *f, u32 blkLen,
+                                     std::string &title, std::string &artist) {
+        u8 tmp[4];
+        if (fread(tmp,1,4,f)!=4) return;
+        u32 vlen = ta_le32(tmp);
+        if (vlen > blkLen) return;
+        fseek(f, (long)vlen, SEEK_CUR);
+        if (fread(tmp,1,4,f)!=4) return;
+        u32 count = ta_le32(tmp);
+        if (count > 2000) return;
+
+        char buf[512];
+        for (u32 i = 0; i < count; i++) {
+            if (fread(tmp,1,4,f)!=4) return;
+            u32 clen = ta_le32(tmp);
+            if (clen == 0) continue;
+            if (clen > 65536) { fseek(f, (long)clen, SEEK_CUR); continue; }
+
+            size_t toRead = std::min((size_t)clen, sizeof(buf)-1);
+            if (fread(buf, 1, toRead, f) != toRead) return;
+            buf[toRead] = '\0';
+            if (clen > (u32)toRead) fseek(f, (long)(clen-toRead), SEEK_CUR);
+
+            char *eq = strchr(buf, '=');
+            if (!eq) continue;
+            *eq = '\0';
+            const char *val = eq + 1;
+
+            if      (title.empty()  && ta_keycmp(buf, "TITLE"))  title  = val;
+            else if (artist.empty() && ta_keycmp(buf, "ARTIST")) artist = val;
+            if (!title.empty() && !artist.empty()) return;
+        }
+    }
+
+    static TitleArtist ta_readFLAC(FILE *f) {
+        TitleArtist ta;
+        fseek(f, 4, SEEK_SET);
+        u8 bh[4];
+        while (fread(bh,1,4,f)==4) {
+            bool last = (bh[0]&0x80)!=0;
+            u8   type = bh[0]&0x7F;
+            u32  len  = ((u32)bh[1]<<16)|((u32)bh[2]<<8)|(u32)bh[3];
+            if (len > 16*1024*1024) break;
+            long blockStart = ftell(f);
+            if (type == 4 && (ta.title.empty() || ta.artist.empty()))
+                ta_readVorbisComment(f, len, ta.title, ta.artist);
+            if (last) break;
+            if (!ta.title.empty() && !ta.artist.empty()) break;
+            fseek(f, blockStart + (long)len, SEEK_SET);
+        }
+        return ta;
+    }
+
+    static TitleArtist ta_readWAV(FILE *f) {
+        fseek(f, 12, SEEK_SET);
+        u8 ch[8];
+        while (fread(ch,1,8,f)==8) {
+            u32 sz = ta_le32(ch+4);
+            if (sz > 16*1024*1024) break;
+            if (memcmp(ch,"id3 ",4)==0 || memcmp(ch,"ID3 ",4)==0) {
+                // Cap at 64 KB — same reasoning as ta_readID3.
+                const u32 readSz = std::min(sz, (u32)(64 * 1024));
+                auto buf = std::make_unique<u8[]>(readSz);
+                if (fread(buf.get(),1,readSz,f)!=readSz) return {};
+                if (readSz < 10 || memcmp(buf.get(),"ID3",3)!=0) return {};
+
+                u8  ver     = buf[3];
+                u8  flags   = buf[5];
+                u32 tagSize = ta_syncsafe(buf.get()+6);
+                if (tagSize+10 > readSz) return {};
+
+                TitleArtist ta;
+                const u8 *data = buf.get();
+                size_t pos = 10;
+                if ((flags & 0x40) && ver >= 3) {
+                    if (pos+4 > readSz) return ta;
+                    u32 exSz = (ver==4) ? ta_syncsafe(data+pos) : ta_be32(data+pos);
+                    pos += exSz;
+                }
+                size_t end = std::min((size_t)(10+tagSize), (size_t)readSz);
+                while (pos+6 < end) {
+                    if (ver == 2) {
+                        if (pos+6 > end) break;
+                        const u8 *fh=data+pos; pos+=6;
+                        if (!fh[0]) break;
+                        u32 fsz=((u32)fh[3]<<16)|((u32)fh[4]<<8)|(u32)fh[5];
+                        if (pos+fsz > sz) break;
+                        if (ta.title.empty()  && memcmp(fh,"TT2",3)==0)
+                            ta.title  = ta_decodeString(data+pos, fsz);
+                        if (ta.artist.empty() && memcmp(fh,"TP1",3)==0)
+                            ta.artist = ta_decodeString(data+pos, fsz);
+                        pos += fsz;
+                    } else {
+                        if (pos+10 > end) break;
+                        const u8 *fh=data+pos; pos+=10;
+                        if (!fh[0]) break;
+                        u32 fsz=(ver==4)?ta_syncsafe(fh+4):ta_be32(fh+4);
+                        if (!fsz || pos+fsz > sz) { pos+=fsz; continue; }
+                        if (ta.title.empty()  && memcmp(fh,"TIT2",4)==0)
+                            ta.title  = ta_decodeString(data+pos, fsz);
+                        if (ta.artist.empty() && memcmp(fh,"TPE1",4)==0)
+                            ta.artist = ta_decodeString(data+pos, fsz);
+                        pos += fsz;
+                    }
+                    if (!ta.title.empty() && !ta.artist.empty()) break;
+                }
+                return ta;
+            }
+            fseek(f, (long)(sz + (sz & 1)), SEEK_CUR);
+        }
+        return {};
+    }
+
+    /* Reads title + artist from embedded tags.
+       Falls back to: title → filename without extension, artist → "Unknown Artist". */
+    static TitleArtist readTitleArtist(const char *path) {
+        TitleArtist ta;
+        FILE *f = fopen(path, "rb");
+        if (!f) return ta;
+
+        u8 magic[4] = {};
+        fread(magic, 1, 4, f);
+
+        if      (memcmp(magic, "ID3",  3) == 0) ta = ta_readID3(f);
+        else if (memcmp(magic, "fLaC", 4) == 0) ta = ta_readFLAC(f);
+        else if (memcmp(magic, "RIFF", 4) == 0) ta = ta_readWAV(f);
+
+        fclose(f);
+
+        if (ta.title.empty()) {
+            const char *slash = std::strrchr(path, '/');
+            const char *name  = slash ? slash+1 : path;
+            ta.title = name;
+            const size_t dot = ta.title.rfind('.');
+            if (dot != std::string::npos && dot > 0)
+                ta.title.resize(dot);
+        }
+        if (ta.artist.empty())
+            ta.artist = "Unknown Artist";
+
+        return ta;
+    }
+
+    /* Builds the display label used for a file entry. */
+    static std::string buildFileLabel(u32 num,
+                                      const std::string &title,
+                                      const std::string &artist) {
+        return std::to_string(num) + ult::DIVIDER_SYMBOL +
+               title + " by " + artist;
+    }
+
+    struct FileEntry {
+        std::string filename;
+        std::string full_path;
+        std::string title;
+        std::string artist;
+    };
+
+    bool FileEntryCompare(const FileEntry &a, const FileEntry &b) {
+        return strcasecmp(a.filename.c_str(), b.filename.c_str()) < 0;
+    }
+
+// =============================================================================
+// BrowserFileItem
+//
+// A ListItem that draws a play/pause indicator exactly like ButtonListItem in
+// gui_playlist.cpp, but conditioned on Folder context + matching folder path.
+// =============================================================================
+
+    constexpr float kBFI_Scale     = 0.65f;
+    constexpr s32   kBFI_SymMargin = 19;
+
+    class BrowserFileItem final : public tsl::elm::ListItem {
+        std::string m_full_path;
+        std::string m_folder_path;  // the directory this file lives in
+        bool        m_was_current = false;
+
+        static constexpr const char *kPlaceholder = "\uE098";
+
+    public:
+        BrowserFileItem(const std::string &label,
+                        const std::string &full_path,
+                        const std::string &folder_path)
+            : ListItem(label, "", /*isMini=*/true)
+            , m_full_path(full_path)
+            , m_folder_path(folder_path) {}
+
+        const std::string &getFullPath() const { return m_full_path; }
+
+        /* True only when Folder context is active for THIS folder and this
+           file is the currently playing track. */
+        bool isCurrent() const {
+            if (play_ctx::source() != play_ctx::Source::Folder) return false;
+            if (play_ctx::folderPath() != m_folder_path)        return false;
+            const char *cp = play_ctx::currentPath();
+            return cp[0] != '\0' &&
+                   strcasecmp(m_full_path.c_str(), cp) == 0;
+        }
+
+        void draw(tsl::gfx::Renderer *renderer) override {
+            const bool cur = isCurrent();
+
+            if (cur != m_was_current) {
+                m_was_current = cur;
+                setValue(cur ? kPlaceholder : "");
+                m_maxWidth = 0;   // force layout recalc on next draw
+            }
+
+            if (!cur) {
+                ListItem::draw(renderer);
+                return;
+            }
+
+            // ---- Draw base item text (suppress the placeholder value so we
+            //      can draw the symbol ourselves at the right scale) ----------
+            const s32 scaledW = static_cast<s32>(26.0f * kBFI_Scale);
+
+            if (!m_maxWidth) {
+                const u16 textMaxW = static_cast<u16>(
+                    static_cast<s32>(getWidth()) - kBFI_SymMargin - scaledW - kBFI_SymMargin - 19);
+                m_maxWidth = static_cast<u16>(
+                    static_cast<s32>(getWidth()) - kBFI_SymMargin - scaledW - kBFI_SymMargin - 55);
+                const u16 textW = static_cast<u16>(
+                    renderer->getTextDimensions(m_text_clean, false, 23).first);
+                m_flags.m_truncated = (textW > textMaxW);
+                if (m_flags.m_truncated) {
+                    m_scrollText.clear();
+                    m_scrollText.reserve(m_text_clean.size() * 2 + 8);
+                    m_scrollText.append(m_text_clean).append("        ");
+                    m_textWidth = static_cast<u16>(
+                        renderer->getTextDimensions(m_scrollText, false, 23).first);
+                    m_scrollText.append(m_text_clean);
+                    m_ellipsisText = renderer->limitStringLength(
+                        m_text_clean, false, 23, textMaxW);
+                } else {
+                    m_textWidth = static_cast<u16>(textW);
+                }
+            }
+
+            {
+                // Temporarily suppress the placeholder so the base draw doesn't
+                // render it — we draw the symbol ourselves at the right scale.
+                // Use swap instead of copy to avoid a heap allocation every frame.
+                std::string saved_value;
+                saved_value.swap(m_value);
+                ListItem::draw(renderer);
+                m_value.swap(saved_value);
+            }
+
+            // ---- Draw play/pause symbol ------------------------------------
+            const s32 cx = getX() + static_cast<s32>(getWidth()) - kBFI_SymMargin - scaledW / 2;
+            const s32 cy = getY() + static_cast<s32>(m_listItemHeight) / 2;
+
+            const bool useClickTextColor =
+                m_touched &&
+                Element::getInputMode() == tsl::InputMode::Touch &&
+                ult::touchInBounds;
+
+            const tsl::Color symColor = (m_focused && ult::useSelectionValue)
+                ? (useClickTextColor ? tsl::clickTextColor : tsl::selectedValueTextColor)
+                : tsl::onTextColor;
+
+            const auto &sym = play_ctx::isPlaying()
+                ? symbol::pause::symbol
+                : symbol::play::symbol;
+
+            sym.draw(play_ctx::isPlaying() ? cx - 1 : cx, cy, renderer, symColor, kBFI_Scale);
+        }
+
+        bool onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY,
+                     s32 prevX, s32 prevY, s32 initialX, s32 initialY) override {
+            if (event == tsl::elm::TouchEvent::Touch)
+                this->m_touched = this->inBounds(currX, currY);
+
+            if (event == tsl::elm::TouchEvent::Release && this->m_touched) {
+                this->m_touched = false;
+                if (Element::getInputMode() == tsl::InputMode::Touch) {
+                    m_clickAnimationProgress = 0;
+                    const bool handled = onClick(HidNpadButton_A);
+                    if (handled) tsl::shiftItemFocus(this);
+                    return handled;
+                }
+            }
+            return false;
+        }
+    };
+
+// =============================================================================
+// BrowserFolderItem
+//
+// A ListItem for directory entries that shows the same play/pause indicator
+// as BrowserFileItem whenever the currently playing file lives inside this
+// folder (or any subfolder of it).  Clicking still just navigates into the
+// folder — the indicator is purely visual.
+// =============================================================================
+
+    class BrowserFolderItem final : public tsl::elm::ListItem {
+        std::string m_sub_path;      // absolute path of this folder, trailing slash included
+        bool        m_was_ancestor = false;
+
+    public:
+        BrowserFolderItem(const std::string &name, const std::string &sub_path)
+            : ListItem(name, "", /*isMini=*/true)
+            , m_sub_path(sub_path) {}
+
+        /* True when Folder context is active and the playing file is inside
+           this folder or any of its subdirectories. */
+        bool isAncestor() const {
+            if (play_ctx::source() != play_ctx::Source::Folder) return false;
+            const std::string &fp = play_ctx::folderPath();
+            // folderPath must start with m_sub_path (which ends with '/').
+            return fp.size() >= m_sub_path.size() &&
+                   fp.compare(0, m_sub_path.size(), m_sub_path) == 0;
+        }
+
+        void draw(tsl::gfx::Renderer *renderer) override {
+            const bool anc = isAncestor();
+
+            if (anc != m_was_ancestor) {
+                m_was_ancestor = anc;
+                setValue(anc ? ult::INPROGRESS_SYMBOL : "");
+                m_maxWidth = 0;   // force layout recalc
+            }
+
+            ListItem::draw(renderer);
+        }
+
+        bool onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY,
+                     s32 prevX, s32 prevY, s32 initialX, s32 initialY) override {
+            if (event == tsl::elm::TouchEvent::Touch)
+                this->m_touched = this->inBounds(currX, currY);
+
+            if (event == tsl::elm::TouchEvent::Release && this->m_touched) {
+                this->m_touched = false;
+                if (Element::getInputMode() == tsl::InputMode::Touch) {
+                    m_clickAnimationProgress = 0;
+                    const bool handled = onClick(HidNpadButton_A);
+                    if (handled) tsl::shiftItemFocus(this);
+                    return handled;
+                }
+            }
+            return false;
+        }
+    };
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+BrowserGui::BrowserGui(std::string path, std::string focus_name, std::string root,
+                       std::function<void(u32)> on_count_changed, u32 depth)
+    : m_frame(nullptr), m_list(nullptr),
+      m_cwd(std::move(path)), m_root(std::move(root)), m_focus_name(std::move(focus_name)),
+      m_on_count_changed(std::move(on_count_changed)), m_depth(depth) {
+
+    if (m_cwd.empty()) {
+        if (ult::isDirectory(base_path)) {
+            m_cwd  = base_path;
+            m_root = base_path;
+        } else {
+            m_cwd  = "/";
+            m_root = "/";
+        }
     }
 }
 
 BrowserGui::~BrowserGui() {
-    fsFsClose(&this->m_fs);
+    // Nothing to close — no FsFileSystem handle.
 }
 
+// ---------------------------------------------------------------------------
+
+void BrowserGui::notifyCountChanged() const {
+    if (!m_on_count_changed) return;
+    // Always report the size of the user's saved playlist, regardless of
+    // whether we're currently in Folder or Playlist context.
+    m_on_count_changed(play_ctx::savedPlaylistSize());
+}
+
+// ---------------------------------------------------------------------------
+
 tsl::elm::Element *BrowserGui::createUI() {
-    m_frame = new SysTuneOverlayFrame();
+    m_frame = new SysTuneOverlayFrame(/*pageLeft=*/"Player", /*pageRight=*/"");
+    m_list  = new tsl::elm::List();
 
-    m_frame->setDescription("\uE0E1  Back     \uE0E0  Add    \uE0E2  Add All");
-    m_frame->setContent(this->m_list);
+    buildList();
 
+    m_frame->setContent(m_list);
     return m_frame;
 }
 
-bool BrowserGui::handleInput(u64 keysDown, u64, const HidTouchState&, HidAnalogStickState, HidAnalogStickState) {
-    if (keysDown & HidNpadButton_B) {
-        if (this->has_music && this->cwd[7] == '\0') {
-            return false;
-        } else if (this->cwd[1] != '\0') {
-            this->upCwd();
-            return true;
-        }
-    } else if (keysDown & HidNpadButton_X) {
-        this->addAllToPlaylist();
+// ---------------------------------------------------------------------------
+
+void BrowserGui::update() {
+    static u8 tick = 0;
+    if ((++tick % 15) == 0)
+        play_ctx::poll();
+}
+
+// ---------------------------------------------------------------------------
+
+bool BrowserGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touchPos,
+                             HidAnalogStickState joyStickPosLeft,
+                             HidAnalogStickState joyStickPosRight) {
+    /* Left footer tap OR KEY_LEFT — store where we are, mark dest as Browse,
+       then swap everything (m_depth browser levels + SettingsGui) with a
+       fresh MainGui.  Stack result: [MainGui] → B exits cleanly. */
+    const bool goLeft = ult::simulatedNextPage.exchange(false, std::memory_order_acq_rel)
+                     || ((keysDown & KEY_LEFT) && !(keysHeld & ~KEY_LEFT & ~KEY_R & ALL_KEYS_MASK));
+    if (goLeft) {
+        setBrowserReturnPath(m_cwd, m_root, m_depth);
+        setPlayerRightDest(PlayerRightDest::Browse);
+        triggerNavigationFeedback();
+        tsl::swapTo<MainGui>(SwapDepth{m_depth + 1});
         return true;
     }
+
+    SysTuneGui::handleInput(keysDown, keysHeld, touchPos, joyStickPosLeft, joyStickPosRight);
+
+    if (keysDown & HidNpadButton_B) {
+        /* At root: let the base class handle it — goBack() returns to SettingsGui
+           which is already on the stack (changeTo was used to enter here). */
+        if (m_cwd == m_root)
+            return false;
+        /* Inside a subdir: pop this level; the parent BrowserGui is on the stack
+           because subdir entry uses changeTo (not swapTo). */
+        triggerExitFeedback();
+        tsl::goBack();
+        return true;
+    }
+
     return false;
 }
 
-void BrowserGui::scanCwd() {
-    tsl::Gui::removeFocus();
-    this->m_list->clear();
+// ---------------------------------------------------------------------------
+// buildList
+// ---------------------------------------------------------------------------
 
-    this->m_list->addItem(new tsl::elm::CategoryHeader("\uE0E7  Play selected path on start up", true));
-
-    /* Show absolute folder path. */
-    this->m_list->addItem(new tsl::elm::CategoryHeader(this->cwd, true));
-
-    /* Open directory. */
-    FsDir dir;
-    Result rc = fsFsOpenDirectory(&this->m_fs, this->cwd, FsDirOpenMode_ReadDirs | FsDirOpenMode_ReadFiles | FsDirOpenMode_NoFileSize, &dir);
-    if (R_FAILED(rc)) {
-        char result_buffer[0x10];
-        std::snprintf(result_buffer, 0x10, "2%03X-%04X", R_MODULE(rc), R_DESCRIPTION(rc));
-        this->m_list->addItem(new tsl::elm::ListItem("something went wrong :/"));
-        this->m_list->addItem(new tsl::elm::ListItem(result_buffer));
+void BrowserGui::buildList() {
+    // Use POSIX opendir/readdir — no FsFileSystem handle needed.
+    std::unique_ptr<DIR, ult::DirCloser> d(opendir(m_cwd.c_str()));
+    if (!d) {
+        m_list->addItem(new tsl::elm::ListItem("Couldn't open: " + m_cwd));
         return;
     }
-    tsl::hlp::ScopeGuard dirGuard([&] { fsDirClose(&dir); });
 
-    std::vector<tsl::elm::ListItem *> folders, files;
+    std::vector<tsl::elm::ListItem *> folders;
+    std::vector<FileEntry>            file_entries;
 
-    /* Iternate over directory. */
-    s64 count = 0;
-    const u64 max = 2048; // max items to be added to the array.
-    std::vector<FsDirectoryEntry> entries(64);
+    folders.reserve(32);
+    file_entries.reserve(32);
 
-    // avoid vector allocs / resize in the loop.
-    folders.reserve(max);
-    files.reserve(max);
+    constexpr u32 kScanMax = 2048;
+    bool hit_max = false;
 
-    while (R_SUCCEEDED(fsDirRead(&dir, &count, entries.size(), entries.data())) && count) {
-        for (s64 i = 0; i < count; i++) {
-            if (folders.size() + files.size() >= max) {
-                break;
-            }
-
-            const auto& entry = entries[i];
-            if (entry.type == FsDirEntryType_Dir) {
-                /* Add directory entries. */
-                auto item = new tsl::elm::ListItem(entry.name);
-                item->setClickListener([this, item](u64 down) -> bool {
-                    if (down & HidNpadButton_A) {
-                        std::strncat(this->cwd, item->getText().c_str(), sizeof(this->cwd) - 1);
-                        std::strncat(this->cwd, "/", sizeof(this->cwd) - 1);
-                        this->scanCwd();
-                        return true;
-                    } else if (down & HidNpadButton_ZR) {
-                        std::snprintf(path_buffer, sizeof(path_buffer), "%s%s", this->cwd, item->getText().c_str());
-                        config::set_load_path(path_buffer);
-                        m_frame->setToast("Set start up file", item->getText().c_str());
-                        return true;
-                    }
-                    return false;
-                });
-                folders.push_back(item);
-            } else if (SupportsType(entry.name)) {
-                /* Add file entry. */
-                auto item = new tsl::elm::ListItem(entry.name);
-                item->setClickListener([this, item](u64 down) -> bool {
-                    if (down & HidNpadButton_A) {
-                        std::snprintf(path_buffer, sizeof(path_buffer), "%s%s", this->cwd, item->getText().c_str());
-                        Result rc = tuneEnqueue(path_buffer, TuneEnqueueType_Back);
-                        if (R_SUCCEEDED(rc)) {
-                            m_frame->setToast("Playlist updated", "Added 1 song to Playlist.");
-                        } else {
-                            m_frame->setToast("Failed to add Track.", "Does the name contain umlauts?");
-                        }
-                        return true;
-                    } else if (down & HidNpadButton_ZR) {
-                        std::snprintf(path_buffer, sizeof(path_buffer), "%s%s", this->cwd, item->getText().c_str());
-                        config::set_load_path(path_buffer);
-                        m_frame->setToast("Set start up file", path_buffer);
-                        return true;
-                    }
-                    return false;
-                });
-                files.push_back(item);
-            }
-        }
-
-        if (folders.size() + files.size() >= max) {
-            m_frame->setToast("Stopped scanning folder", "maximum of " + std::to_string(max) + " hit");
+    struct dirent *ent;
+    while ((ent = readdir(d.get())) != nullptr) {
+        if (folders.size() + file_entries.size() >= kScanMax) {
+            hit_max = true;
             break;
         }
-    }
-    if (folders.size() == 0 && files.size() == 0) {
-        this->m_list->addItem(new tsl::elm::CategoryHeader("Empty..."));
-        return;
-    }
+        if (ent->d_name[0] == '.') continue;  // skip hidden and . / ..
 
-    tsl::elm::ListItem* focus_elm = nullptr;
+        if (ent->d_type == DT_DIR) {
+            const std::string sub_path  = m_cwd + ent->d_name + "/";
+            const std::string root_copy = m_root;
 
-    if (folders.size() > 0) {
-        std::sort(folders.begin(), folders.end(), ListItemTextCompare);
+            auto *item = new BrowserFolderItem(ent->d_name, sub_path);
+            item->setClickListener([this, item, sub_path, root_copy](u64 down) -> bool {
+                if (down & HidNpadButton_A) {
+                    tsl::shiftItemFocus(item);
+                    tsl::changeTo<BrowserGui>(sub_path, "", root_copy, m_on_count_changed, m_depth + 1);
+                    return true;
+                }
+                if (down & HidNpadButton_Y) {
+                    addAllToPlaylist(sub_path);
+                    return true;
+                }
+                if (down & KEY_MINUS) {
+                    const std::string no_slash = sub_path.substr(0, sub_path.size() - 1);
+                    config::set_load_path(no_slash.c_str());
+                    if (tsl::notification)
+                        tsl::notification->showNow(item->getText(), 26, "Startup Folder Set", 2500, false);
+                    return true;
+                }
+                return false;
+            });
+            folders.push_back(item);
 
-        focus_elm = folders[0];
-
-        for (auto element : folders)
-            this->m_list->addItem(element);
-    }
-    if (files.size() > 0) {
-        this->m_list->addItem(new tsl::elm::CategoryHeader("Files"));
-        std::sort(files.begin(), files.end(), ListItemTextCompare);
-
-        if (!focus_elm)
-            focus_elm = files[0];
-
-        for (auto element : files)
-            this->m_list->addItem(element);
-    }
-
-    if (focus_elm)
-        tsl::Gui::requestFocus(focus_elm, tsl::FocusDirection::None);
-}
-
-void BrowserGui::upCwd() {
-    size_t length = std::strlen(this->cwd);
-    if (length <= 1)
-        return;
-
-    for (size_t i = length - 2; i >= 0; i--) {
-        if (this->cwd[i] == '/') {
-            this->cwd[i + 1] = '\0';
-            this->scanCwd();
-            return;
+        } else if (ent->d_type == DT_REG && SupportsType(ent->d_name)) {
+            TitleArtist ta = readTitleArtist((m_cwd + ent->d_name).c_str());
+            file_entries.push_back({
+                std::string(ent->d_name),
+                m_cwd + ent->d_name,
+                std::move(ta.title),
+                std::move(ta.artist)
+            });
         }
     }
-}
 
-void BrowserGui::addAllToPlaylist() {
-    FsDir dir;
-    Result rc = fsFsOpenDirectory(&this->m_fs, this->cwd, FsDirOpenMode_ReadFiles|FsDirOpenMode_NoFileSize, &dir);
-    if (R_FAILED(rc)) {
-        char result_buffer[0x10];
-        std::snprintf(result_buffer, 0x10, "2%03X-%04X", R_MODULE(rc), R_DESCRIPTION(rc));
-        this->m_list->addItem(new tsl::elm::ListItem("something went wrong :/"));
-        this->m_list->addItem(new tsl::elm::ListItem(result_buffer));
+    if (hit_max) {
+        if (tsl::notification)
+            tsl::notification->showNow(
+                "Maximum of " + std::to_string(kScanMax) + " hit!", 26,
+                "Stopped Scanning Folder", 2500, false);
+    }
+
+    if (folders.empty() && file_entries.empty()) {
+        m_list->addItem(new tsl::elm::CategoryHeader("Empty..."));
         return;
     }
-    tsl::hlp::ScopeGuard dirGuard([&] { fsDirClose(&dir); });
 
-    std::vector<std::string> file_list;
-    s64 songs_added = 0;
-    s64 count = 0;
-    const u64 max = 300; // max set by PLAYLIST_ENTRY_MAX in music_player.cpp
-    std::vector<FsDirectoryEntry> entries(64);
+    tsl::elm::ListItem *focus_elm              = nullptr;  // default focus (first item / nav-back)
+    tsl::elm::ListItem *playing_focus_elm      = nullptr;  // overrides when this folder is active
+    tsl::elm::ListItem *playing_folder_focus_elm = nullptr; // subfolder that contains the playing file
 
-    // avoid vector allocs / resize in the loop.
-    file_list.reserve(max);
+    // Compute which direct child folder (if any) is an ancestor of the
+    // currently playing file's folder.  Used to auto-focus the right subfolder
+    // when the user navigates back up from a deeply-nested playing context.
+    // Uses pointer arithmetic to avoid temporary string allocations.
+    std::string playing_subfolder_name;
+    {
+        if (play_ctx::source() == play_ctx::Source::Folder) {
+            const std::string &fp = play_ctx::folderPath();
+            if (fp.size() > m_cwd.size() &&
+                fp.compare(0, m_cwd.size(), m_cwd) == 0)
+            {
+                const char *rest  = fp.c_str() + m_cwd.size();
+                const char *slash = std::strchr(rest, '/');
+                if (slash && slash > rest)
+                    playing_subfolder_name.assign(rest, slash - rest);
+            }
+        }
+    }
 
-    while (R_SUCCEEDED(fsDirRead(&dir, &count, entries.size(), entries.data())) && count) {
-        for (s64 i = 0; i < count; i++) {
-            const auto& entry = entries[i];
-            if (entry.type == FsDirEntryType_File && SupportsType(entry.name)){
-                file_list.emplace_back(entry.name);
+    // ---- Folders -----------------------------------------------------------
+    if (!folders.empty()) {
+        m_list->addItem(new tsl::elm::CategoryHeader(
+            m_cwd + " " + ult::DIVIDER_SYMBOL + " \uE0E3 Add To Playlist " +
+            ult::DIVIDER_SYMBOL + " \uE0B6 Set As Startup", true));
 
-                if (file_list.size() >= max) {
-                    break;
+        std::sort(folders.begin(), folders.end(), ListItemTextCompare);
+        for (auto *el : folders) {
+            m_list->addItem(el);
+            if (!m_focus_name.empty() && el->getText() == m_focus_name)
+                focus_elm = el;
+            // Track which subfolder leads toward the currently playing file.
+            if (!playing_subfolder_name.empty() && el->getText() == playing_subfolder_name)
+                playing_folder_focus_elm = el;
+        }
+        if (!focus_elm)
+            focus_elm = folders[0];
+    }
+
+    // ---- Files -------------------------------------------------------------
+    if (!file_entries.empty()) {
+        m_list->addItem(new tsl::elm::CategoryHeader(
+            "Tracks " + ult::DIVIDER_SYMBOL +
+            " \uE0E3 Add To Playlist " + ult::DIVIDER_SYMBOL +
+            " \uE0E2 Add All "         + ult::DIVIDER_SYMBOL +
+            " \uE0B6 Set As Startup"));
+
+        std::sort(file_entries.begin(), file_entries.end(), FileEntryCompare);
+
+        // Always populate m_folder_songs from the SORTED file_entries BEFORE
+        // any shuffle reorder.  This guarantees it matches the service's
+        // m_playlist (enqueue order = sorted), so sorted_idx lookups at click
+        // time are always correct regardless of what display order is used.
+        m_folder_songs.clear();
+        m_folder_songs.reserve(file_entries.size());
+        for (const auto &fe : file_entries)
+            m_folder_songs.push_back(fe.full_path);
+
+        // If this folder is the active playing context and shuffle is on,
+        // reorder file_entries (display only) to match the IPC queue order.
+        // m_folder_songs is intentionally NOT rebuilt here — it stays sorted.
+        {
+            TuneShuffleMode shuffleMode = TuneShuffleMode_Off;
+            tuneGetShuffleMode(&shuffleMode);
+
+            const bool thisFolderIsActive =
+                play_ctx::source() == play_ctx::Source::Folder &&
+                play_ctx::folderPath() == m_cwd;
+
+            if (shuffleMode != TuneShuffleMode_Off && thisFolderIsActive) {
+                u32 ipc_count = 0;
+                if (R_SUCCEEDED(tuneGetPlaylistSize(&ipc_count)) && ipc_count > 0) {
+                    std::unordered_map<std::string, FileEntry> lookup;
+                    lookup.reserve(file_entries.size());
+                    for (auto &fe : file_entries)
+                        lookup.emplace(fe.full_path, std::move(fe));
+
+                    std::vector<FileEntry> reordered;
+                    reordered.reserve(ipc_count);
+
+                    char ipc_path[FS_MAX_PATH];
+                    for (u32 i = 0; i < ipc_count; ++i) {
+                        if (R_SUCCEEDED(tuneGetPlaylistItem(i, ipc_path, sizeof(ipc_path)))) {
+                            auto it = lookup.find(ipc_path);
+                            if (it != lookup.end()) {
+                                reordered.push_back(std::move(it->second));
+                                lookup.erase(it);
+                            }
+                        }
+                    }
+                    // Append any filesystem entries not found in the IPC queue.
+                    for (auto &[_, fe] : lookup)
+                        reordered.push_back(std::move(fe));
+
+                    file_entries = std::move(reordered);
                 }
             }
         }
 
-        if (file_list.size() >= max) {
-            break;
+        // Determine whether this folder is currently the active playing context
+        // so we can pre-select the currently playing item for focus.
+        const bool thisFolderActive =
+            play_ctx::source() == play_ctx::Source::Folder &&
+            play_ctx::folderPath() == m_cwd;
+        const char *cp = play_ctx::currentPath();
+
+        for (u32 idx = 0; idx < static_cast<u32>(file_entries.size()); ++idx) {
+            const FileEntry &fe = file_entries[idx];
+
+            const std::string label     = buildFileLabel(idx + 1, fe.title, fe.artist);
+            const std::string full_path = fe.full_path;
+
+            auto *item = new BrowserFileItem(label, full_path, m_cwd);
+
+            // Capture only 'this' and 'item'. The correct sorted index is
+            // resolved at click time via std::find on m_folder_songs (always
+            // sorted), so it is never stale from a shuffle reorder.
+            item->setClickListener([this, item](u64 down) -> bool {
+                const std::string &full_path = item->getFullPath();
+
+                // ---- A: play from this folder ------------------------------
+                if (down & HidNpadButton_A) {
+                    // Toggle play/pause if tapping the already-playing track.
+                    if (play_ctx::source() == play_ctx::Source::Folder &&
+                        play_ctx::folderPath() == m_cwd &&
+                        play_ctx::currentPath()[0] != '\0' &&
+                        strcasecmp(full_path.c_str(), play_ctx::currentPath()) == 0)
+                    {
+                        if (play_ctx::isPlaying()) { tunePause(); }
+                        else                       { tunePlay();  }
+                        play_ctx::poll();
+                        return true;
+                    }
+
+                    // m_folder_songs is always sorted — find the sorted index.
+                    // This is the correct positional index for both tuneSelect
+                    // and switchToFolder regardless of display order.
+                    const auto it = std::find(m_folder_songs.begin(),
+                                              m_folder_songs.end(), full_path);
+                    const u32 sorted_idx = (it != m_folder_songs.end())
+                        ? static_cast<u32>(it - m_folder_songs.begin()) : 0u;
+
+                    const bool samefolder =
+                        play_ctx::source() == play_ctx::Source::Folder &&
+                        play_ctx::folderPath() == m_cwd;
+
+                    TuneShuffleMode shuffleMode = TuneShuffleMode_Off;
+                    tuneGetShuffleMode(&shuffleMode);
+
+                    if (samefolder && shuffleMode != TuneShuffleMode_Off) {
+                        // Same folder, shuffle on: IPC queue is already loaded
+                        // in the correct shuffle order. Scan it to find the
+                        // exact shuffled position — no queue reload needed.
+                        play_ctx::startByPath(full_path);
+                    } else {
+                        // Different folder OR shuffle off: always disable shuffle
+                        // so m_playlist stays sorted and matches m_folder_songs.
+                        // This ensures next/prev match the visual list on re-entry.
+                        if (shuffleMode != TuneShuffleMode_Off) {
+                            tuneSetShuffleMode(TuneShuffleMode_Off);
+                            config::set_shuffle(TuneShuffleMode_Off);
+                        }
+                        if (!play_ctx::switchToFolder(m_cwd, m_folder_songs, sorted_idx)) {
+                            if (tsl::notification)
+                                tsl::notification->showNow("Failed to switch to folder.");
+                        }
+                    }
+
+                    play_ctx::poll();
+                    notifyCountChanged();
+                    return true;
+                }
+
+                // ---- Y: add to playlist (saved[], and IPC when in Playlist ctx)
+                if (down & HidNpadButton_Y) {
+                    //tsl::shiftItemFocus(item);
+                    if (play_ctx::source() == play_ctx::Source::Playlist) {
+                        // Playlist context — add to IPC and saved[] together.
+                        Result r = tuneEnqueue(full_path.c_str(), TuneEnqueueType_Back);
+                        if (R_SUCCEEDED(r)) {
+                            play_ctx::savedAppend(full_path);
+                            if (tsl::notification)
+                                tsl::notification->showNow("Added 1 track to Playlist.");
+                            notifyCountChanged();
+                        } else {
+                            if (tsl::notification)
+                                tsl::notification->showNow("Failed to add track.");
+                        }
+                    } else {
+                        // Folder context — IPC has folder songs; only update saved[].
+                        play_ctx::savedAppend(full_path);
+                        if (tsl::notification)
+                            tsl::notification->showNow("Added 1 track to Playlist.");
+                        notifyCountChanged();
+                    }
+                    return true;
+                }
+
+                // ---- X: add all songs in this directory --------------------
+                if (down & HidNpadButton_X) {
+                    addAllToPlaylist(m_cwd);
+                    return true;
+                }
+
+                // ---- Minus: set as startup file ----------------------------
+                if (down & KEY_MINUS) {
+                    config::set_load_path(full_path.c_str());
+                    if (tsl::notification)
+                        tsl::notification->showNow(item->getText(), 26, "Startup File Set", 2500, false);
+                    return true;
+                }
+                return false;
+            });
+
+            // Pre-set focus on the currently playing item when re-entering
+            // this folder while it is the active folder context.
+            if (thisFolderActive && cp[0] != '\0' &&
+                strcasecmp(full_path.c_str(), cp) == 0)
+            {
+                playing_focus_elm = item;
+            }
+
+            if (!focus_elm)
+                focus_elm = item;
+
+            m_list->addItem(item);
         }
     }
 
-    std::sort(file_list.begin(), file_list.end(), StringTextCompare);
-    for (auto const & file : file_list) {
-        std::snprintf(path_buffer, sizeof(path_buffer), "%s%s", this->cwd, file.c_str());
-        rc = tuneEnqueue(path_buffer, TuneEnqueueType_Back);
-        if (R_SUCCEEDED(rc)) songs_added++;
+    // ---- Focus resolution --------------------------------------------------
+    // Priority: playing file (exact folder match)
+    //         > nav-back name (explicit user navigation, always respected)
+    //         > playing subfolder (breadcrumb toward playing file, passive)
+    //         > first item
+    if (playing_focus_elm) {
+        m_list->jumpToItem(playing_focus_elm->getText());
+    } else if (!m_focus_name.empty()) {
+        // User just pressed B out of this child — return cursor there.
+        m_list->jumpToItem(m_focus_name);
+    } else if (playing_folder_focus_elm) {
+        // No explicit nav target — guide cursor toward the playing file.
+        m_list->jumpToItem(playing_folder_focus_elm->getText());
+    } else if (focus_elm) {
+        tsl::Gui::requestFocus(focus_elm, tsl::FocusDirection::None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+std::string BrowserGui::parentPath() const {
+    if (m_cwd.size() <= 1) return m_cwd;
+    const size_t pos = m_cwd.rfind('/', m_cwd.size() - 2);
+    if (pos == std::string::npos) return "/";
+    return m_cwd.substr(0, pos + 1);
+}
+
+std::string BrowserGui::currentDirName() const {
+    if (m_cwd.size() <= 1) return "";
+    const size_t end   = m_cwd.size() - 1;
+    const size_t start = m_cwd.rfind('/', end - 1);
+    if (start == std::string::npos) return m_cwd.substr(0, end);
+    return m_cwd.substr(start + 1, end - start - 1);
+}
+
+// ---------------------------------------------------------------------------
+// addAllToPlaylist
+//
+// Adds every supported file in 'path' to the user's playlist.
+// When in Playlist context: adds to IPC AND saved[].
+// When in Folder context:   adds to saved[] only (IPC has folder songs).
+// ---------------------------------------------------------------------------
+
+void BrowserGui::addAllToPlaylist(const std::string &path) {
+    std::unique_ptr<DIR, ult::DirCloser> d(opendir(path.c_str()));
+    if (!d) {
+        if (tsl::notification) tsl::notification->show("something went wrong :/");
+        return;
     }
 
-    std::snprintf(path_buffer, sizeof(path_buffer), "Added %ld songs to Playlist.", songs_added);
-    m_frame->setToast("Playlist updated", path_buffer);
+    std::vector<std::string> file_list;
+    file_list.reserve(64);
+    constexpr u32 kAddAllMax = 300;
+
+    struct dirent *ent;
+    while ((ent = readdir(d.get())) != nullptr && file_list.size() < kAddAllMax) {
+        if (ent->d_type == DT_REG && SupportsType(ent->d_name))
+            file_list.emplace_back(ent->d_name);
+    }
+
+    std::sort(file_list.begin(), file_list.end(), StringTextCompare);
+
+    s64 songs_added = 0;
+    const bool inPlaylist = (play_ctx::source() == play_ctx::Source::Playlist);
+    Result rc = 0;
+
+    for (const auto &file : file_list) {
+        const std::string full = path + file;
+
+        if (inPlaylist) {
+            rc = tuneEnqueue(full.c_str(), TuneEnqueueType_Back);
+            if (R_SUCCEEDED(rc)) {
+                play_ctx::savedAppend(full);
+                songs_added++;
+            }
+        } else {
+            play_ctx::savedAppend(full);
+            songs_added++;
+        }
+    }
+
+    char msg[64];
+    std::snprintf(msg, sizeof(msg), "Added %ld tracks to Playlist.", songs_added);
+    if (tsl::notification) tsl::notification->showNow(msg);
+    if (songs_added > 0)
+        notifyCountChanged();
 }
