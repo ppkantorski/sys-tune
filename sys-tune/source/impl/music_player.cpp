@@ -11,6 +11,7 @@
 
 #include <cstring>
 #include <nxExt.h>
+#include <strings.h>
 
 namespace tune::impl {
 
@@ -83,7 +84,7 @@ namespace tune::impl {
             }
 
             bool Swap(u32 src, u32 dst, ShuffleMode shuffle) {
-                if (src >= Size() || dst >+ Size()) {
+                if (src >= Size() || dst >= Size()) {
                     return false;
                 }
 
@@ -356,33 +357,41 @@ namespace tune::impl {
                             Enqueue(load_path, std::strlen(load_path), EnqueueType::Back);
                         }
                     } else {
-                        // path is a folder, load all entries.
+                        // path is a folder, load all entries sorted case-insensitively
+                        // so the startup playlist order matches the browser's display order.
                         FsDir dir;
                         if (R_SUCCEEDED(sdmc::OpenDir(&dir, load_path, FsDirOpenMode_ReadFiles|FsDirOpenMode_NoFileSize))) {
-                            // during init, we have a lot of memory to work with.
-                            std::vector<FsDirectoryEntry> entries(std::min(64, PLAYLIST_ENTRY_MAX));
+                            // Collect all supported filenames first, then sort, then enqueue.
+                            std::vector<std::string> file_names;
+                            file_names.reserve(PLAYLIST_ENTRY_MAX);
 
+                            std::vector<FsDirectoryEntry> entries(std::min(64, PLAYLIST_ENTRY_MAX));
                             s64 total;
-                            char full_path[PATH_SIZE_MAX];
-                            Result rc = 0;
 
                             while (R_SUCCEEDED(fsDirRead(&dir, &total, entries.size(), entries.data())) && total) {
                                 for (s64 i = 0; i < total; i++) {
                                     if (GetSourceType(entries[i].name) != SourceType::NONE) {
-                                        std::snprintf(full_path, sizeof(full_path), "%s/%s", load_path, entries[i].name);
-                                        rc = Enqueue(full_path, std::strlen(full_path), EnqueueType::Back);
-                                        if (rc == tune::OutOfMemory) {
-                                            break;
-                                        }
+                                        file_names.emplace_back(entries[i].name);
                                     }
                                 }
-
-                                if (rc == tune::OutOfMemory) {
+                                if (static_cast<int>(file_names.size()) >= PLAYLIST_ENTRY_MAX)
                                     break;
-                                }
                             }
 
                             fsDirClose(&dir);
+
+                            // Sort case-insensitively — matches BrowserGui / addAllToPlaylist().
+                            std::sort(file_names.begin(), file_names.end(), [](const std::string &a, const std::string &b) {
+                                return strcasecmp(a.c_str(), b.c_str()) < 0;
+                            });
+
+                            char full_path[PATH_SIZE_MAX];
+                            for (const auto &name : file_names) {
+                                std::snprintf(full_path, sizeof(full_path), "%s/%s", load_path, name.c_str());
+                                const Result rc = Enqueue(full_path, std::strlen(full_path), EnqueueType::Back);
+                                if (rc == tune::OutOfMemory)
+                                    break;
+                            }
                         }
                     }
                 }
@@ -575,12 +584,29 @@ namespace tune::impl {
 
     void SetShuffleMode(ShuffleMode mode) {
         std::scoped_lock lk(g_mutex);
-
-        // if we just enabled shuffle mode, re-shuffle the playlist.
+    
         if (g_shuffle == ShuffleMode::Off && mode == ShuffleMode::On) {
+            // Shuffle the playlist randomly first.
             g_playlist.Shuffle();
+    
+            // Then pin the currently playing track to position 0 in the
+            // shuffle list so it stays playing without any interruption,
+            // and next/prev navigate forward from there.
+            if (g_current.IsValid()) {
+                const u32 cur_pos = g_playlist.GetIndexFromID(g_current, ShuffleMode::On);
+                if (cur_pos != 0)
+                    g_playlist.Swap(0, cur_pos, ShuffleMode::On);
+                g_queue_position = 0;
+            }
+    
+        } else if (g_shuffle == ShuffleMode::On && mode == ShuffleMode::Off) {
+            // Restore queue_position to wherever the current track sits in
+            // the original unshuffled list, so next/prev work naturally
+            // from that position in the original order.
+            if (g_current.IsValid())
+                g_queue_position = g_playlist.GetIndexFromID(g_current, ShuffleMode::Off);
         }
-
+    
         g_shuffle = mode;
     }
 

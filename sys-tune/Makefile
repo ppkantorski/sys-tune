@@ -62,13 +62,17 @@ endif
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS	:=	-flto=auto -g -Wall -O2 -ffunction-sections \
+CFLAGS	:=	-g -Wall -Os -ffunction-sections -fdata-sections \
+			-ffast-math -fomit-frame-pointer -fno-stack-protector \
+			-flto -ffat-lto-objects \
+            -fuse-linker-plugin -finline-small-functions \
+            -fno-strict-aliasing -frename-registers -falign-functions=16 \
 			$(ARCH) $(DEFINES)
 
 CFLAGS	+=	$(INCLUDE) -DTUNE_API_VERSION=$(API_VERSION) -DNDEBUG=1 \
 			$(WANT_FLAGS)
 
-CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++23
+CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=c++26
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)

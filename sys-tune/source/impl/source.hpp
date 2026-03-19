@@ -3,6 +3,7 @@
 #include <nxExt.h>
 #include <memory>
 #include "resamplers/SDL_audioEX.h"
+#include <strings.h>
 
 enum class SourceType {
     NONE,
