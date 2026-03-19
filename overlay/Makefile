@@ -43,13 +43,16 @@ TARGET		:=	sys-tune-overlay
 BUILD		:=	build
 SOURCES		:=	source ../ipc ../common/minIni ../common/sdmc ../common/config ../common/pm ../common/aud
 DATA		:=	data
-INCLUDES	:=	lib/include ../ipc ../common
+INCLUDES	:=	../ipc ../common
 APP_VERSION	:=	$(VERSION)
 NO_ICON		:=  1
 
-ifeq ($(RELEASE),)
-	APP_VERSION	:=	$(APP_VERSION)-$(shell git describe --dirty --always)
-endif
+# This location should reflect where you place the libultrahand directory (lib can vary between projects).
+include ${TOPDIR}/lib/libultrahand/ultrahand.mk
+
+#ifeq ($(RELEASE),)
+#	APP_VERSION	:=	$(APP_VERSION)-$(shell git describe --dirty --always)
+#endif
 
 WANT_FLAGS	:=
 
@@ -70,18 +73,28 @@ endif
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS	:=	-g -Wall -Wno-format-truncation -O2 -ffunction-sections \
-			$(ARCH) $(DEFINES)
+CFLAGS := -g -Wall -Os -ffunction-sections -fdata-sections -flto \
+          -fuse-linker-plugin -fomit-frame-pointer -finline-small-functions \
+          -fno-strict-aliasing -frename-registers -falign-functions=16 \
+          $(ARCH) $(DEFINES)
+
+# Enable appearance overriding
+UI_OVERRIDE_PATH := /config/sys-tune/
+CFLAGS += -DUI_OVERRIDE_PATH="\"$(UI_OVERRIDE_PATH)\""
+
+# Enable Widget
+USING_WIDGET_DIRECTIVE := 1  # or true
+CFLAGS += -DUSING_WIDGET_DIRECTIVE=$(USING_WIDGET_DIRECTIVE)
 
 CFLAGS	+=	$(INCLUDE) -DVERSION=\"v$(APP_VERSION)\" -DTUNE_API_VERSION=$(API_VERSION) -DNDEBUG=1 \
 			$(WANT_FLAGS)
 
-CXXFLAGS	:= $(CFLAGS) -fno-exceptions -std=c++23
+CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=c++26
 
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS	:= -lnx
+LIBS := -lcurl -lz -lmbedtls -lmbedx509 -lmbedcrypto -lnx
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
@@ -206,6 +219,8 @@ all	:	 $(OUTPUT).ovl
 $(OUTPUT).ovl		:	$(OUTPUT).elf $(OUTPUT).nacp
 	@elf2nro $< $@ $(NROFLAGS)
 	@echo "built ... $(notdir $(OUTPUT).ovl)"
+	@printf 'ULTR' >> $@
+	@printf "Ultrahand signature has been added.\n"
 
 $(OUTPUT).elf	:	$(OFILES)
 
