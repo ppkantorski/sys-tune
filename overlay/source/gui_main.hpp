@@ -7,7 +7,7 @@
 #include <tesla.hpp>
 
 class SysTuneOverlayFrame;
-class VolumeTrackBar;
+#include "elm_volume.hpp"
 
 // ---------------------------------------------------------------------------
 // PlayerRightDest — updated by Playlist/Browser when leaving to the player,
