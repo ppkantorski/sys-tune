@@ -100,6 +100,7 @@ public:
                          currY >= this->getY() + 12  && currY <= this->getY() + 75);
                     if (stillInIcon) {
                         m_iconTapCallback();
+                        tsl::shiftItemFocus(this);
                         triggerNavigationFeedback();
                     }
                 } else if (event == tsl::elm::TouchEvent::Touch) {

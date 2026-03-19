@@ -140,26 +140,26 @@ public:
             renderer->drawRect(0, 0, 1, 720, a(tsl::edgeSeparatorColor));
 
         // --- Toast ---
-        if (m_toast) {
-            const s32 toastW = tsl::cfg::FramebufferWidth - 20;
-            const s32 toastH = 110;
-            const s32 toastX = 10;
-            s32 startY = tsl::cfg::FramebufferHeight - toastH;
-
-            constexpr u32 fadeDuration = 10;
-            if (m_toast->Current < fadeDuration)
-                startY += toastH - static_cast<s32>(toastH / fadeDuration) * static_cast<s32>(m_toast->Current);
-            if (m_toast->Duration - m_toast->Current < fadeDuration)
-                startY += toastH - static_cast<s32>(toastH / fadeDuration) * static_cast<s32>(m_toast->Duration - m_toast->Current);
-
-            renderer->drawRect(toastX,     startY,     toastW,     toastH,     a(tsl::bottomTextColor));
-            renderer->drawRect(toastX + 3, startY + 3, toastW - 6, toastH - 6, a(tsl::defaultBackgroundColor));
-            renderer->drawString(m_toast->Header.c_str(),  false, toastX + 10, startY + 40, 26, tsl::bottomTextColor);
-            renderer->drawString(m_toast->Content.c_str(), false, toastX + 10, startY + 80, 23, tsl::bottomTextColor, toastW - 20);
-
-            if (++m_toast->Current >= m_toast->Duration)
-                m_toast = std::nullopt;
-        }
+        //if (m_toast) {
+        //    const s32 toastW = tsl::cfg::FramebufferWidth - 20;
+        //    const s32 toastH = 110;
+        //    const s32 toastX = 10;
+        //    s32 startY = tsl::cfg::FramebufferHeight - toastH;
+        //    
+        //    constexpr u32 fadeDuration = 10;
+        //    if (m_toast->Current < fadeDuration)
+        //        startY += toastH - static_cast<s32>(toastH / fadeDuration) * static_cast<s32>(m_toast->Current);
+        //    if (m_toast->Duration - m_toast->Current < fadeDuration)
+        //        startY += toastH - static_cast<s32>(toastH / fadeDuration) * static_cast<s32>(m_toast->Duration - m_toast->Current);
+        //    
+        //    renderer->drawRect(toastX,     startY,     toastW,     toastH,     a(tsl::bottomTextColor));
+        //    renderer->drawRect(toastX + 3, startY + 3, toastW - 6, toastH - 6, a(tsl::defaultBackgroundColor));
+        //    renderer->drawString(m_toast->Header.c_str(),  false, toastX + 10, startY + 40, 26, tsl::bottomTextColor);
+        //    renderer->drawString(m_toast->Content.c_str(), false, toastX + 10, startY + 80, 23, tsl::bottomTextColor, toastW - 20);
+        //    
+        //    if (++m_toast->Current >= m_toast->Duration)
+        //        m_toast = std::nullopt;
+        //}
     }
 
     // -----------------------------------------------------------------------
@@ -203,11 +203,11 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    struct Toast { std::string Header, Content; u32 Duration, Current; };
-
-    void setToast(std::string header, std::string content) {
-        m_toast = Toast{ std::move(header), std::move(content), 150, 0 };
-    }
+    //struct Toast { std::string Header, Content; u32 Duration, Current; };
+    //
+    //void setToast(std::string header, std::string content) {
+    //    m_toast = Toast{ std::move(header), std::move(content), 150, 0 };
+    //}
 
 private:
     // -----------------------------------------------------------------------
@@ -293,5 +293,5 @@ private:
     std::string        m_pageRightName;
     ScrollState        m_titleScroll;
     ScrollState        m_subScroll;
-    std::optional<Toast> m_toast;
+    //std::optional<Toast> m_toast;
 };
