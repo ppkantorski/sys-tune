@@ -19,7 +19,6 @@
 static PlayerRightDest g_player_right_dest   = PlayerRightDest::Settings;
 static std::string     g_browser_return_cwd;
 static std::string     g_browser_return_root;
-static u32             g_browser_return_depth = 1;
 
 // ---------------------------------------------------------------------------
 // Volume mute-backup persistence
@@ -55,52 +54,16 @@ void setBrowserReturnPath(const std::string& cwd, const std::string& root) {
     g_browser_return_root  = root;
 }
 
-void setBrowserReturnPath(const std::string& cwd, const std::string& root, u32 depth) {
-    g_browser_return_cwd   = cwd;
-    g_browser_return_root  = root;
-    g_browser_return_depth = depth;
-}
-
 // ---------------------------------------------------------------------------
-// Reconstruct the full BrowserGui hierarchy from root down to cwd so that
-// pressing B navigates up one folder at a time, exactly as if the user had
-// drilled down manually.  Each level beyond root is a separate changeTo so
-// the Tesla stack mirrors the original navigation.
+// Return to the exact browser directory the user was in.
+// The stack is always [SettingsGui, BrowserGui] — one changeTo is enough.
+// Pressing B inside BrowserGui swaps to the parent directory, so the full
+// tree is navigable without ever growing the stack beyond depth 2.
 // ---------------------------------------------------------------------------
 static void pushBrowserStack() {
-    const std::string &root = g_browser_return_root;
-    const std::string &cwd  = g_browser_return_cwd;
-
-    // Collect all path levels from root down to (and including) cwd.
-    std::vector<std::string> levels;
-    levels.push_back(root);
-    std::string cur = root;
-    while (cur.size() < cwd.size()) {
-        // Find the next '/' after cur's trailing slash.
-        const size_t next = cwd.find('/', cur.size());
-        if (next == std::string::npos) break;
-        cur = cwd.substr(0, next + 1);
-        if (cur != root)
-            levels.push_back(cur);
-    }
-
-    // Push root as the first level (depth=1), then each sub-level with
-    // changeTo so the stack grows: [SettingsGui, root, sub1, ..., cwd].
-    // The focus_name for each intermediate level is the child folder name
-    // so B lands back on the right item when popping.
-    for (size_t i = 0; i < levels.size(); ++i) {
-        const u32 depth = static_cast<u32>(i + 1);
-        std::string focus;
-        if (i + 1 < levels.size()) {
-            // Focus the subfolder we drilled into.
-            const std::string &child = levels[i + 1];
-            const size_t start = levels[i].size();
-            const size_t end   = child.rfind('/');
-            if (end != std::string::npos && end > start)
-                focus = child.substr(start, end - start);
-        }
-        tsl::changeTo<BrowserGui>(levels[i], focus, root, nullptr, depth);
-    }
+    tsl::changeTo<BrowserGui>(
+        g_browser_return_cwd, /*focus_name=*/"",
+        g_browser_return_root, /*on_count_changed=*/nullptr);
 }
 
 // =============================================================================
@@ -345,7 +308,7 @@ tsl::elm::Element* SettingsGui::createUI() {
             tsl::shiftItemFocus(browser_button);
             tsl::changeTo<BrowserGui>("", "", "", [this](u32 count) {
                 refreshPlaylistCount(count);
-            }, 1);
+            });
             return true;
         }
         return false;

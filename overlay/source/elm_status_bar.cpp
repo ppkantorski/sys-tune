@@ -11,8 +11,7 @@
 
 #include <cstdio>
 #include <cstring>
-#include <memory>       /* std::make_unique */
-#include <algorithm>    /* std::min        */
+#include <algorithm>    /* std::min */
 
 // =============================================================================
 // Tag / art extraction helpers
@@ -48,7 +47,6 @@ namespace {
         return *a == '\0' && *b == '\0';
     }
 
-    struct BufSpan  { size_t offset = 0; size_t size = 0; };
     struct ArtRegion {
         long   offset = -1;
         size_t size   = 0;
@@ -95,91 +93,107 @@ namespace {
         return result;
     }
 
-    static void scanID3Buffer(const u8 *data, size_t total,
-                               BufSpan &art, std::string &title, std::string &artist) {
-        if (total < 10 || memcmp(data, "ID3", 3) != 0) return;
-        u8  ver     = data[3];
-        u8  flags   = data[5];
-        u32 tagSize = syncsafe(data + 6);
-        size_t pos  = 10;
+    /* Streaming ID3 frame scanner — reads directly from FILE, zero heap allocation.
+     * 'ver' is the ID3 major version (2, 3, or 4); 'end' is the absolute file
+     * offset one byte past the last byte of the ID3 tag block.
+     * Records art region as an absolute file offset so loadArt can seek straight
+     * to it without keeping the tag data alive. */
+    static void scanID3Stream(FILE *f, u8 ver, long end, TrackTags &tags) {
+        constexpr size_t kTextMax = 512;
+        u8 textBuf[kTextMax];
 
-        if ((flags & 0x40) && ver >= 3) {
-            if (pos + 4 > total) return;
-            u32 exSz = (ver == 4) ? syncsafe(data+pos) : be32(data+pos);
-            pos += exSz;
-        }
-        size_t end = std::min((size_t)(10 + tagSize), total);
+        while (true) {
+            if (tags.art.valid() && !tags.title.empty() && !tags.artist.empty()) break;
 
-        while (pos + 6 < end) {
+            const long here = ftell(f);
+            if (here < 0) break;
+
             if (ver == 2) {
-                if (pos + 6 > end) break;
-                const u8 *fh = data + pos; pos += 6;
-                if (!fh[0]) break;
-                u32 sz = ((u32)fh[3]<<16)|((u32)fh[4]<<8)|(u32)fh[5];
-                if (pos + sz > total) break;
+                if (here + 6 > end) break;
+                u8 fh[6];
+                if (fread(fh,1,6,f) != 6 || !fh[0]) break;
+                const u32 sz = ((u32)fh[3]<<16)|((u32)fh[4]<<8)|(u32)fh[5];
+                if (sz == 0 || here + 6 + (long)sz > end) break;
+                const long frameEnd = here + 6 + (long)sz;
 
-                if (!art.size && memcmp(fh, "PIC", 3) == 0 && sz > 6) {
-                    size_t p = pos + 1 + 3 + 1;
-                    while (p < pos+sz && data[p]) { p++; } p++;
-                    if (p < pos+sz) art = {p, pos+sz-p};
-                }
-                else if (title.empty()  && memcmp(fh, "TT2", 3) == 0)
-                    title  = extractID3String(data+pos, sz);
-                else if (artist.empty() && memcmp(fh, "TP1", 3) == 0)
-                    artist = extractID3String(data+pos, sz);
-
-                pos += sz;
-            } else {
-                if (pos + 10 > end) break;
-                const u8 *fh = data + pos; pos += 10;
-                if (!fh[0]) break;
-                u32 sz = (ver == 4) ? syncsafe(fh+4) : be32(fh+4);
-                if (!sz || pos + sz > total) { pos += sz; continue; }
-
-                if (!art.size && memcmp(fh, "APIC", 4) == 0) {
-                    u8 enc = data[pos];
-                    size_t p = pos + 1;
-                    while (p < pos+sz && data[p]) { p++; } p++;  /* skip MIME + null */
-                    if (p >= pos+sz) { pos += sz; continue; }
-                    p++;                                           /* picture type */
-                    if (enc == 1 || enc == 2) {
-                        while (p+1 < pos+sz && (data[p]||data[p+1])) { p+=2; } p+=2;
-                    } else {
-                        while (p < pos+sz && data[p]) { p++; } p++;
+                if (!tags.art.valid() && memcmp(fh,"PIC",3) == 0 && sz > 5) {
+                    /* enc(1) + image_format(3) + picture_type(1) */
+                    u8 tmp[5];
+                    if (fread(tmp,1,5,f) == 5) {
+                        u8 c;
+                        while (ftell(f) < frameEnd && fread(&c,1,1,f)==1 && c) {}
+                        const long imgStart = ftell(f);
+                        const long imgSize  = frameEnd - imgStart;
+                        if (imgSize > 0) tags.art = {imgStart, (size_t)imgSize};
                     }
-                    if (p < pos+sz) art = {p, pos+sz-p};
+                } else if (tags.title.empty() && memcmp(fh,"TT2",3) == 0) {
+                    const size_t rd = std::min((size_t)sz, kTextMax);
+                    if (fread(textBuf,1,rd,f) == rd)
+                        tags.title = extractID3String(textBuf, rd);
+                } else if (tags.artist.empty() && memcmp(fh,"TP1",3) == 0) {
+                    const size_t rd = std::min((size_t)sz, kTextMax);
+                    if (fread(textBuf,1,rd,f) == rd)
+                        tags.artist = extractID3String(textBuf, rd);
                 }
-                else if (title.empty()  && memcmp(fh, "TIT2", 4) == 0)
-                    title  = extractID3String(data+pos, sz);
-                else if (artist.empty() && memcmp(fh, "TPE1", 4) == 0)
-                    artist = extractID3String(data+pos, sz);
+                fseek(f, frameEnd, SEEK_SET);
 
-                pos += sz;
+            } else { /* v2.3 / v2.4 */
+                if (here + 10 > end) break;
+                u8 fh[10];
+                if (fread(fh,1,10,f) != 10 || !fh[0]) break;
+                const u32 sz = (ver == 4) ? syncsafe(fh+4) : be32(fh+4);
+                if (sz == 0) continue; /* zero-size padding frame; header already consumed */
+                if (here + 10 + (long)sz > end) break;
+                const long frameEnd = here + 10 + (long)sz;
+
+                if (!tags.art.valid() && memcmp(fh,"APIC",4) == 0) {
+                    u8 enc, c;
+                    if (fread(&enc,1,1,f) != 1) { fseek(f, frameEnd, SEEK_SET); continue; }
+                    while (ftell(f) < frameEnd && fread(&c,1,1,f)==1 && c) {}   /* MIME type */
+                    if (fread(&c,1,1,f) != 1)  { fseek(f, frameEnd, SEEK_SET); continue; }   /* picture type */
+                    if (enc == 1 || enc == 2) {
+                        u8 two[2];
+                        while (ftell(f)+1 < frameEnd && fread(two,1,2,f)==2 && (two[0]||two[1])) {}
+                    } else {
+                        while (ftell(f) < frameEnd && fread(&c,1,1,f)==1 && c) {}   /* description */
+                    }
+                    const long imgStart = ftell(f);
+                    const long imgSize  = frameEnd - imgStart;
+                    if (imgSize > 0) tags.art = {imgStart, (size_t)imgSize};
+                } else if (tags.title.empty() && memcmp(fh,"TIT2",4) == 0) {
+                    const size_t rd = std::min((size_t)sz, kTextMax);
+                    if (fread(textBuf,1,rd,f) == rd)
+                        tags.title = extractID3String(textBuf, rd);
+                } else if (tags.artist.empty() && memcmp(fh,"TPE1",4) == 0) {
+                    const size_t rd = std::min((size_t)sz, kTextMax);
+                    if (fread(textBuf,1,rd,f) == rd)
+                        tags.artist = extractID3String(textBuf, rd);
+                }
+                fseek(f, frameEnd, SEEK_SET);
             }
-
-            if (art.size && !title.empty() && !artist.empty()) break;
         }
     }
 
     static TrackTags readTagsMP3(FILE *f) {
         fseek(f, 0, SEEK_SET);
         u8 hdr[10];
-        if (fread(hdr,1,10,f)!=10 || memcmp(hdr,"ID3",3)!=0) return {};
-        u32 tagSize = syncsafe(hdr+6);
-        if (tagSize > 16*1024*1024) return {};
+        if (fread(hdr,1,10,f) != 10 || memcmp(hdr,"ID3",3) != 0) return {};
+        const u8  ver     = hdr[3];
+        const u8  flags   = hdr[5];
+        const u32 tagSize = syncsafe(hdr + 6);
+        if (tagSize > 32u * 1024u * 1024u) return {};
 
-        size_t total = 10 + tagSize;
-        auto buf = std::make_unique<u8[]>(total);
-        memcpy(buf.get(), hdr, 10);
-        fseek(f, 10, SEEK_SET);
-        if (fread(buf.get()+10, 1, tagSize, f) != tagSize) return {};
+        /* Skip extended header (ID3v2.3/v2.4 only). */
+        if ((flags & 0x40) && ver >= 3) {
+            u8 ex[4];
+            if (fread(ex,1,4,f) != 4) return {};
+            const u32 exSz = (ver == 4) ? syncsafe(ex) : be32(ex);
+            if (exSz < 4) return {};
+            fseek(f, (long)(exSz - 4), SEEK_CUR);
+        }
 
         TrackTags tags;
-        BufSpan apic;
-        scanID3Buffer(buf.get(), total, apic, tags.title, tags.artist);
-
-        if (apic.size)
-            tags.art = {(long)apic.offset, apic.size};
+        scanID3Stream(f, ver, 10 + (long)tagSize, tags);
         return tags;
     }
 
@@ -263,20 +277,30 @@ namespace {
     static TrackTags readTagsWAV(FILE *f) {
         fseek(f, 12, SEEK_SET);
         u8 ch[8];
-        while (fread(ch,1,8,f)==8) {
-            u32 sz = le32(ch+4);
-            if (sz > 16*1024*1024) break;
-            if (memcmp(ch,"id3 ",4)==0 || memcmp(ch,"ID3 ",4)==0) {
-                long chunkStart = ftell(f);
-                auto buf = std::make_unique<u8[]>(sz);
-                if (fread(buf.get(),1,sz,f)!=sz) return {};
+        while (fread(ch,1,8,f) == 8) {
+            const u32 sz = le32(ch+4);
+            if (sz > 32u * 1024u * 1024u) break;
+            if (memcmp(ch,"id3 ",4) == 0 || memcmp(ch,"ID3 ",4) == 0) {
+                const long chunkStart = ftell(f);
+                const long chunkEnd   = chunkStart + (long)sz;
 
+                u8 id3hdr[10];
+                if (fread(id3hdr,1,10,f) != 10 || memcmp(id3hdr,"ID3",3) != 0) return {};
+                const u8  ver     = id3hdr[3];
+                const u8  flags   = id3hdr[5];
+                const u32 tagSize = syncsafe(id3hdr + 6);
+
+                if ((flags & 0x40) && ver >= 3) {
+                    u8 ex[4];
+                    if (fread(ex,1,4,f) != 4) return {};
+                    const u32 exSz = (ver == 4) ? syncsafe(ex) : be32(ex);
+                    if (exSz < 4) return {};
+                    fseek(f, (long)(exSz - 4), SEEK_CUR);
+                }
+
+                const long end = std::min(chunkEnd, chunkStart + (long)(10 + tagSize));
                 TrackTags tags;
-                BufSpan apic;
-                scanID3Buffer(buf.get(), sz, apic, tags.title, tags.artist);
-
-                if (apic.size)
-                    tags.art = {chunkStart + (long)apic.offset, apic.size};
+                scanID3Stream(f, ver, end, tags);
                 return tags;
             }
             fseek(f, (long)(sz + (sz & 1)), SEEK_CUR);
@@ -772,16 +796,36 @@ bool StatusBar::onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY,
     const s32   thumbX    = barX + static_cast<s32>(barLength * thumb_pct);
     const bool  nearThumb = (std::abs(currX - thumbX) <= 20 && std::abs(currY - barY) <= 20);
 
-    if (event == tsl::elm::TouchEvent::Touch && nearThumb)
-        this->m_seeking = true;
+    if (event == tsl::elm::TouchEvent::Touch && nearThumb) {
+        this->m_seeking                = true;
+        this->m_seek_feedback_last_pct = -1.f;
+    }
 
     if (this->m_seeking) {
         s32 clampedX = std::max(barX, std::min(currX, barX + barLength));
         this->m_seek_percentage = float(clampedX - barX) / float(barLength);
+
+        /* Update the timestamp display immediately so it tracks the thumb
+           with no lag — same pattern as NudgeSeek on the controller path. */
+        if (m_stats.total_frames > 0 && m_stats.sample_rate > 0) {
+            const u32 sec = static_cast<u32>(m_seek_percentage * float(m_stats.total_frames))
+                            / m_stats.sample_rate;
+            std::snprintf(current_buffer, sizeof(current_buffer),
+                          "%d:%02d", sec / 60, sec % 60);
+        }
+
         if (event == tsl::elm::TouchEvent::Release) {
             tuneSeek(static_cast<u32>(this->m_seek_percentage * float(this->m_stats.total_frames)));
             this->m_percentage = this->m_seek_percentage;
             this->m_seeking    = false;
+        } else if (event == tsl::elm::TouchEvent::Hold ||
+                   event == tsl::elm::TouchEvent::Scroll) {
+            constexpr float kFeedbackInterval = 0.05f;
+            if (m_seek_feedback_last_pct < 0.f ||
+                std::abs(m_seek_percentage - m_seek_feedback_last_pct) >= kFeedbackInterval) {
+                triggerNavigationFeedback();
+                m_seek_feedback_last_pct = m_seek_percentage;
+            }
         }
         return true;
     }
@@ -874,7 +918,10 @@ void StatusBar::update() {
         float(this->m_stats.current_frame) / float(this->m_stats.total_frames),
         0.0f, 1.0f);
 
-    std::snprintf(current_buffer, sizeof(current_buffer), "%d:%02d", current / 60, current % 60);
+    /* Don't overwrite current_buffer while the user is touch-dragging —
+       onTouch writes it live to track the thumb position. */
+    if (!m_seeking)
+        std::snprintf(current_buffer, sizeof(current_buffer), "%d:%02d", current / 60, current % 60);
     std::snprintf(total_buffer,   sizeof(total_buffer),   "%d:%02d", total   / 60, total   % 60);
 }
 
@@ -921,7 +968,7 @@ bool StatusBar::loadArt(const char *fullPath) {
     m_artist_counter      = 0;
     m_artist_truncated    = false;
 
-    if (!tags.art.valid()) {
+    if (!tags.art.valid() || ult::limitedMemory) {
         fclose(f);
         fill_placeholder();
         return true;
@@ -929,17 +976,33 @@ bool StatusBar::loadArt(const char *fullPath) {
 
     fseek(f, tags.art.offset, SEEK_SET);
     FileRegion fr{ f, tags.art.offset + (long)tags.art.size };
-    int w, h, ch_unused;
-    u8 *px = stbi_load_from_callbacks(&k_stbi_cbs, &fr, &w, &h, &ch_unused, 3);
-    fclose(f);
 
-    if (!px || w > 2048 || h > 2048) {
-        if (px) stbi_image_free(px);
+    /* Check image dimensions BEFORE allocating the decode buffer.
+     * stbi_info reads only the compressed header — negligible cost.
+     * Without this, a 2048×2048 JPEG would allocate ~12 MB only to
+     * be freed immediately when the post-decode size check fires. */
+    int iw = 0, ih = 0, ich = 0;
+    if (!stbi_info_from_callbacks(&k_stbi_cbs, &fr, &iw, &ih, &ich)
+        || iw <= 0 || ih <= 0 || iw > 2048 || ih > 2048) {
+        fclose(f);
         fill_placeholder();
         return true;
     }
 
-    toRGBA4444_from_RGB(px, w, h, sz, m_art_rgba4444.data());
+    /* Re-seek: stbi_info advanced the file pointer into the image stream. */
+    fseek(f, tags.art.offset, SEEK_SET);
+    fr = { f, tags.art.offset + (long)tags.art.size };
+
+    u8 *px = stbi_load_from_callbacks(&k_stbi_cbs, &fr, &iw, &ih, &ich, 3);
+    fclose(f);
+
+    if (!px) {
+        fill_placeholder();
+        return true;
+    }
+
+    /* iw/ih are guaranteed within [1..2048] by the info check above. */
+    toRGBA4444_from_RGB(px, iw, ih, sz, m_art_rgba4444.data());
     stbi_image_free(px);
 
     m_art_scaled_size = sz;
@@ -1113,9 +1176,10 @@ void StatusBar::onHeld(u64 keysHeld) {
         /* --- Seekbar hold: preview-only, commit on release --- */
         if (!m_ctrl_scrubbing) {
             /* First repeat tick — initialise the preview from current position. */
-            m_seek_percentage = m_percentage;
-            m_ctrl_scrubbing  = true;
-            m_seeking         = true;
+            m_seek_percentage        = m_percentage;
+            m_ctrl_scrubbing         = true;
+            m_seeking                = true;
+            m_seek_feedback_last_pct = -1.f;
         }
 
         if (m_stats.total_frames > 0 && m_stats.sample_rate > 0) {
@@ -1130,7 +1194,15 @@ void StatusBar::onHeld(u64 keysHeld) {
                 ? std::min(m_seek_percentage + step, 1.0f)
                 : std::max(m_seek_percentage - step, 0.0f);
         }
-        triggerNavigationFeedback();
+
+        /* Fire haptic every 2% of track progress — feels like physical notches,
+           scales naturally with both slow precise and fast accelerated scrubbing. */
+        constexpr float kFeedbackInterval = 0.02f;
+        if (m_seek_feedback_last_pct < 0.f ||
+            std::abs(m_seek_percentage - m_seek_feedback_last_pct) >= kFeedbackInterval) {
+            triggerNavigationFeedback();
+            m_seek_feedback_last_pct = m_seek_percentage;
+        }
     } else {
         /* --- Button row hold: cycle through buttons --- */
         if (holdRight && m_active_btn < 4) {

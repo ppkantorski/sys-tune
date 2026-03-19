@@ -17,7 +17,6 @@ void setPlayerRightDest(PlayerRightDest dest);
 // Store the exact browser path the user was at, so right-from-player
 // returns there (not the currently-playing folder).
 void setBrowserReturnPath(const std::string& cwd, const std::string& root);
-void setBrowserReturnPath(const std::string& cwd, const std::string& root, u32 depth);
 
 // ---------------------------------------------------------------------------
 // Page 0 — Player

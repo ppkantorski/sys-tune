@@ -269,10 +269,10 @@ namespace {
 // ---------------------------------------------------------------------------
 
 BrowserGui::BrowserGui(std::string path, std::string focus_name, std::string root,
-                       std::function<void(u32)> on_count_changed, u32 depth)
+                       std::function<void(u32)> on_count_changed)
     : m_frame(nullptr), m_list(nullptr),
       m_cwd(std::move(path)), m_root(std::move(root)), m_focus_name(std::move(focus_name)),
-      m_on_count_changed(std::move(on_count_changed)), m_depth(depth) {
+      m_on_count_changed(std::move(on_count_changed)) {
 
     if (m_cwd.empty()) {
         if (ult::isDirectory(base_path)) {
@@ -324,29 +324,30 @@ bool BrowserGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &to
                              HidAnalogStickState joyStickPosLeft,
                              HidAnalogStickState joyStickPosRight) {
     /* Left footer tap OR KEY_LEFT — store where we are, mark dest as Browse,
-       then swap everything (m_depth browser levels + SettingsGui) with a
-       fresh MainGui.  Stack result: [MainGui] → B exits cleanly. */
+       then swap [SettingsGui, BrowserGui] with a fresh MainGui.
+       Stack is always exactly depth 2, so SwapDepth{2} is always correct. */
     const bool goLeft = ult::simulatedNextPage.exchange(false, std::memory_order_acq_rel)
                      || ((keysDown & KEY_LEFT) && !(keysHeld & ~KEY_LEFT & ~KEY_R & ALL_KEYS_MASK));
     if (goLeft) {
-        setBrowserReturnPath(m_cwd, m_root, m_depth);
+        setBrowserReturnPath(m_cwd, m_root);
         setPlayerRightDest(PlayerRightDest::Browse);
         triggerNavigationFeedback();
-        tsl::swapTo<MainGui>(SwapDepth{m_depth + 1});
+        tsl::swapTo<MainGui>(SwapDepth{2});
         return true;
     }
 
     SysTuneGui::handleInput(keysDown, keysHeld, touchPos, joyStickPosLeft, joyStickPosRight);
 
     if (keysDown & HidNpadButton_B) {
-        /* At root: let the base class handle it — goBack() returns to SettingsGui
-           which is already on the stack (changeTo was used to enter here). */
+        /* At root: return false so the base class calls goBack(), popping
+           BrowserGui and returning to SettingsGui. */
         if (m_cwd == m_root)
             return false;
-        /* Inside a subdir: pop this level; the parent BrowserGui is on the stack
-           because subdir entry uses changeTo (not swapTo). */
+        /* Inside a subdir: swap this BrowserGui with one at the parent directory.
+           focus_name = current dir name so the cursor lands on the right item.
+           Stack stays constant: [SettingsGui, BrowserGui]. */
         triggerExitFeedback();
-        tsl::goBack();
+        tsl::swapTo<BrowserGui>(parentPath(), currentDirName(), m_root, m_on_count_changed);
         return true;
     }
 
@@ -390,7 +391,9 @@ void BrowserGui::buildList() {
             item->setClickListener([this, item, sub_path, root_copy](u64 down) -> bool {
                 if (down & HidNpadButton_A) {
                     tsl::shiftItemFocus(item);
-                    tsl::changeTo<BrowserGui>(sub_path, "", root_copy, m_on_count_changed, m_depth + 1);
+                    // swapTo keeps the stack at constant depth [SettingsGui, BrowserGui].
+                    // focus_name="" — we're entering, not returning, so no item to focus.
+                    tsl::swapTo<BrowserGui>(sub_path, "", root_copy, m_on_count_changed);
                     return true;
                 }
                 if (down & HidNpadButton_Y) {

@@ -54,6 +54,7 @@ class StatusBar final : public tsl::elm::Element {
     bool m_r_held  = false;  /* true while KEY_R is held */
     bool m_seeking = false;
     bool m_ctrl_scrubbing = false;  /* true while controller hold is previewing a seek */
+    float m_seek_feedback_last_pct = -1.f; /* last seek % at which haptic fired; -1 = not yet fired this scrub */
     float m_seek_percentage = 0.0f;
 
     /* Hold-repeat state for Left/Right navigation and seek scrubbing. */
