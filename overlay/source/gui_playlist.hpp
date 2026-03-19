@@ -19,6 +19,7 @@ class PlaylistGui final : public SysTuneGui {
     /* on_count_changed is called immediately after any mutation with the new
        playlist size.  Pass nullptr (default) if you don't need the callback. */
     explicit PlaylistGui(std::function<void(u32)> on_count_changed = nullptr);
+    ~PlaylistGui();
 
     tsl::elm::Element *createUI() override;
     void update() override;

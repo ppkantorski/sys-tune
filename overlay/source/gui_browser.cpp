@@ -286,7 +286,7 @@ BrowserGui::BrowserGui(std::string path, std::string focus_name, std::string roo
 }
 
 BrowserGui::~BrowserGui() {
-    // Nothing to close — no FsFileSystem handle.
+    delete m_list;
 }
 
 // ---------------------------------------------------------------------------

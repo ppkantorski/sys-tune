@@ -145,10 +145,11 @@ namespace {
             }
 
             {
-                const std::string saved_value = m_value;
-                m_value = "";
+                // Use swap to avoid a heap allocation on every frame.
+                std::string saved_value;
+                saved_value.swap(m_value);
                 ListItem::draw(renderer);
-                m_value = saved_value;
+                m_value.swap(saved_value);
             }
 
             const s32 cx = getX() + static_cast<s32>(getWidth()) - kSymMargin - scaledW / 2;
@@ -196,6 +197,10 @@ namespace {
 // Builds the UI from play_ctx::savedPlaylist() — the user's persisted list —
 // regardless of whether we are currently in Playlist or Folder context.
 // =============================================================================
+
+PlaylistGui::~PlaylistGui() {
+    delete m_list;
+}
 
 PlaylistGui::PlaylistGui(std::function<void(u32)> on_count_changed)
     : m_on_count_changed(std::move(on_count_changed)) {

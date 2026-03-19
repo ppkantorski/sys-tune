@@ -58,61 +58,71 @@ static std::string ta_decodeString(const u8 *payload, size_t size) {
 
 // ---- ID3v2 (MP3) ------------------------------------------------------------
 
+/* Streaming frame scanner — walks ID3v2 frames directly from FILE*, with only
+ * a 512-byte stack buffer for text payloads.  Zero heap allocation. */
+static void ta_scanID3Stream(FILE *f, u8 ver, long end, TitleArtist &ta) {
+    constexpr size_t kTextMax = 512;
+    u8 textBuf[kTextMax];
+
+    while (ta.title.empty() || ta.artist.empty()) {
+        const long here = ftell(f);
+        if (here < 0 || here >= end) break;
+
+        if (ver == 2) {
+            if (here + 6 > end) break;
+            u8 fh[6];
+            if (fread(fh,1,6,f) != 6 || !fh[0]) break;
+            const u32 sz = ((u32)fh[3]<<16)|((u32)fh[4]<<8)|(u32)fh[5];
+            if (sz == 0 || here + 6 + (long)sz > end) break;
+            const long frameEnd = here + 6 + (long)sz;
+            if (ta.title.empty()  && memcmp(fh,"TT2",3) == 0) {
+                const size_t rd = std::min((size_t)sz, kTextMax);
+                if (fread(textBuf,1,rd,f) == rd) ta.title  = ta_decodeString(textBuf, rd);
+            } else if (ta.artist.empty() && memcmp(fh,"TP1",3) == 0) {
+                const size_t rd = std::min((size_t)sz, kTextMax);
+                if (fread(textBuf,1,rd,f) == rd) ta.artist = ta_decodeString(textBuf, rd);
+            }
+            fseek(f, frameEnd, SEEK_SET);
+        } else {
+            if (here + 10 > end) break;
+            u8 fh[10];
+            if (fread(fh,1,10,f) != 10 || !fh[0]) break;
+            const u32 sz = (ver == 4) ? ta_syncsafe(fh+4) : ta_be32(fh+4);
+            if (sz == 0) continue;
+            if (here + 10 + (long)sz > end) break;
+            const long frameEnd = here + 10 + (long)sz;
+            if (ta.title.empty()  && memcmp(fh,"TIT2",4) == 0) {
+                const size_t rd = std::min((size_t)sz, kTextMax);
+                if (fread(textBuf,1,rd,f) == rd) ta.title  = ta_decodeString(textBuf, rd);
+            } else if (ta.artist.empty() && memcmp(fh,"TPE1",4) == 0) {
+                const size_t rd = std::min((size_t)sz, kTextMax);
+                if (fread(textBuf,1,rd,f) == rd) ta.artist = ta_decodeString(textBuf, rd);
+            }
+            fseek(f, frameEnd, SEEK_SET);
+        }
+    }
+}
+
 static TitleArtist ta_readID3(FILE *f) {
     fseek(f, 0, SEEK_SET);
     u8 hdr[10];
-    if (fread(hdr,1,10,f)!=10 || memcmp(hdr,"ID3",3)!=0) return {};
-    u8  ver     = hdr[3];
-    u8  flags   = hdr[5];
-    u32 tagSize = ta_syncsafe(hdr+6);
-    if (tagSize > 16*1024*1024) return {};
-    // Cap at 64 KB — title/artist frames are always near the front.
-    // Only embedded album art pushes tags beyond this, and we don't need it.
-    constexpr u32 kMaxTagRead = 64 * 1024;
-    if (tagSize > kMaxTagRead) tagSize = kMaxTagRead;
+    if (fread(hdr,1,10,f) != 10 || memcmp(hdr,"ID3",3) != 0) return {};
+    const u8  ver     = hdr[3];
+    const u8  flags   = hdr[5];
+    const u32 tagSize = ta_syncsafe(hdr+6);
+    if (tagSize > 32u * 1024u * 1024u) return {};
 
-    size_t total = 10 + tagSize;
-    auto buf = std::make_unique<u8[]>(total);
-    memcpy(buf.get(), hdr, 10);
-    fseek(f, 10, SEEK_SET);
-    if (fread(buf.get()+10, 1, tagSize, f) != tagSize) return {};
+    /* Skip extended header (ID3v2.3/v2.4). */
+    if ((flags & 0x40) && ver >= 3) {
+        u8 ex[4];
+        if (fread(ex,1,4,f) != 4) return {};
+        const u32 exSz = (ver == 4) ? ta_syncsafe(ex) : ta_be32(ex);
+        if (exSz < 4) return {};
+        fseek(f, (long)(exSz - 4), SEEK_CUR);
+    }
 
     TitleArtist ta;
-    const u8 *data = buf.get();
-    size_t pos = 10;
-    if ((flags & 0x40) && ver >= 3) {
-        if (pos+4 > total) return ta;
-        u32 exSz = (ver==4) ? ta_syncsafe(data+pos) : ta_be32(data+pos);
-        pos += exSz;
-    }
-    size_t end = std::min((size_t)(10+tagSize), total);
-
-    while (pos+6 < end) {
-        if (ver == 2) {
-            if (pos+6 > end) break;
-            const u8 *fh = data+pos; pos+=6;
-            if (!fh[0]) break;
-            u32 sz = ((u32)fh[3]<<16)|((u32)fh[4]<<8)|(u32)fh[5];
-            if (pos+sz > total) break;
-            if (ta.title.empty()  && memcmp(fh,"TT2",3)==0)
-                ta.title  = ta_decodeString(data+pos, sz);
-            if (ta.artist.empty() && memcmp(fh,"TP1",3)==0)
-                ta.artist = ta_decodeString(data+pos, sz);
-            pos += sz;
-        } else {
-            if (pos+10 > end) break;
-            const u8 *fh = data+pos; pos+=10;
-            if (!fh[0]) break;
-            u32 sz = (ver==4) ? ta_syncsafe(fh+4) : ta_be32(fh+4);
-            if (!sz || pos+sz > total) { pos+=sz; continue; }
-            if (ta.title.empty()  && memcmp(fh,"TIT2",4)==0)
-                ta.title  = ta_decodeString(data+pos, sz);
-            if (ta.artist.empty() && memcmp(fh,"TPE1",4)==0)
-                ta.artist = ta_decodeString(data+pos, sz);
-            pos += sz;
-        }
-        if (!ta.title.empty() && !ta.artist.empty()) break;
-    }
+    ta_scanID3Stream(f, ver, 10 + (long)tagSize, ta);
     return ta;
 }
 
@@ -176,56 +186,30 @@ static TitleArtist ta_readFLAC(FILE *f) {
 static TitleArtist ta_readWAV(FILE *f) {
     fseek(f, 12, SEEK_SET);
     u8 ch[8];
-    while (fread(ch,1,8,f)==8) {
-        u32 sz = ta_le32(ch+4);
-        if (sz > 16*1024*1024) break;
-        if (memcmp(ch,"id3 ",4)==0 || memcmp(ch,"ID3 ",4)==0) {
-            // Cap at 64 KB — same reasoning as ta_readID3.
-            const u32 readSz = std::min(sz, (u32)(64 * 1024));
-            auto buf = std::make_unique<u8[]>(readSz);
-            if (fread(buf.get(),1,readSz,f)!=readSz) return {};
-            if (readSz < 10 || memcmp(buf.get(),"ID3",3)!=0) return {};
+    while (fread(ch,1,8,f) == 8) {
+        const u32 sz = ta_le32(ch+4);
+        if (sz > 32u * 1024u * 1024u) break;
+        if (memcmp(ch,"id3 ",4) == 0 || memcmp(ch,"ID3 ",4) == 0) {
+            const long chunkStart = ftell(f);
+            const long chunkEnd   = chunkStart + (long)sz;
 
-            u8  ver     = buf[3];
-            u8  flags   = buf[5];
-            u32 tagSize = ta_syncsafe(buf.get()+6);
-            if (tagSize+10 > readSz) return {};
+            u8 id3hdr[10];
+            if (fread(id3hdr,1,10,f) != 10 || memcmp(id3hdr,"ID3",3) != 0) return {};
+            const u8  ver     = id3hdr[3];
+            const u8  flags   = id3hdr[5];
+            const u32 tagSize = ta_syncsafe(id3hdr + 6);
 
-            TitleArtist ta;
-            const u8 *data = buf.get();
-            size_t pos = 10;
             if ((flags & 0x40) && ver >= 3) {
-                if (pos+4 > readSz) return ta;
-                u32 exSz = (ver==4) ? ta_syncsafe(data+pos) : ta_be32(data+pos);
-                pos += exSz;
+                u8 ex[4];
+                if (fread(ex,1,4,f) != 4) return {};
+                const u32 exSz = (ver == 4) ? ta_syncsafe(ex) : ta_be32(ex);
+                if (exSz < 4) return {};
+                fseek(f, (long)(exSz - 4), SEEK_CUR);
             }
-            size_t end = std::min((size_t)(10+tagSize), (size_t)readSz);
-            while (pos+6 < end) {
-                if (ver == 2) {
-                    if (pos+6 > end) break;
-                    const u8 *fh=data+pos; pos+=6;
-                    if (!fh[0]) break;
-                    u32 fsz=((u32)fh[3]<<16)|((u32)fh[4]<<8)|(u32)fh[5];
-                    if (pos+fsz > sz) break;
-                    if (ta.title.empty()  && memcmp(fh,"TT2",3)==0)
-                        ta.title  = ta_decodeString(data+pos, fsz);
-                    if (ta.artist.empty() && memcmp(fh,"TP1",3)==0)
-                        ta.artist = ta_decodeString(data+pos, fsz);
-                    pos += fsz;
-                } else {
-                    if (pos+10 > end) break;
-                    const u8 *fh=data+pos; pos+=10;
-                    if (!fh[0]) break;
-                    u32 fsz=(ver==4)?ta_syncsafe(fh+4):ta_be32(fh+4);
-                    if (!fsz || pos+fsz > sz) { pos+=fsz; continue; }
-                    if (ta.title.empty()  && memcmp(fh,"TIT2",4)==0)
-                        ta.title  = ta_decodeString(data+pos, fsz);
-                    if (ta.artist.empty() && memcmp(fh,"TPE1",4)==0)
-                        ta.artist = ta_decodeString(data+pos, fsz);
-                    pos += fsz;
-                }
-                if (!ta.title.empty() && !ta.artist.empty()) break;
-            }
+
+            const long end = std::min(chunkEnd, chunkStart + (long)(10 + tagSize));
+            TitleArtist ta;
+            ta_scanID3Stream(f, ver, end, ta);
             return ta;
         }
         fseek(f, (long)(sz + (sz & 1)), SEEK_CUR);
