@@ -621,22 +621,29 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
     /* --- Time labels --- */
     /* While controller-scrubbing, derive the preview time from m_seek_percentage
        so the left timestamp tracks the thumb in real time. */
+    const s32 label_y = this->getY() + bar_off + CenterOfLine(1) + 9;
+
     if (m_ctrl_scrubbing && m_stats.total_frames > 0 && m_stats.sample_rate > 0) {
         const u32 preview_frame = static_cast<u32>(m_seek_percentage * float(m_stats.total_frames));
         const u32 preview_sec   = preview_frame / m_stats.sample_rate;
         char preview_buf[0x20];
         std::snprintf(preview_buf, sizeof(preview_buf), "%d:%02d", preview_sec / 60, preview_sec % 60);
         renderer->drawString(preview_buf, false,
-            this->getX() + 15,
-            this->getY() + bar_off + CenterOfLine(1) + 9, 20, 0xffff);
+            bar_x, label_y, 20, 0xffff);
     } else {
         renderer->drawString(current_buffer, false,
-            this->getX() + 15,
-            this->getY() + bar_off + CenterOfLine(1) + 9, 20, 0xffff);
+            bar_x, label_y, 20, 0xffff);
     }
-    renderer->drawString(total_buffer, false,
-        this->getX() + this->getWidth() - 75 + 14,
-        this->getY() + bar_off + CenterOfLine(1) + 9, 20, 0xffff);
+
+    // Right-align the total duration to the bar's right edge.
+    // Measure the actual text width so any duration string fits precisely.
+    {
+        const s32 bar_right = bar_x + bar_len;
+        const s32 total_w   = static_cast<s32>(
+            renderer->getTextDimensions(total_buffer, false, 20).first);
+        renderer->drawString(total_buffer, false,
+            bar_right - total_w, label_y, 20, 0xffff);
+    }
 
     /* --- Focus highlight (button row) --- */
     if (this->m_focused && m_active_btn != 5) {
