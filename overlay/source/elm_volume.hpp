@@ -94,7 +94,11 @@ public:
                 (initialX >= this->getX() + 30 && initialX <= this->getX() + 75 &&
                  initialY >= this->getY() + 22  && initialY <= this->getY() + 65);
             if (inIcon) {
-                if (event == tsl::elm::TouchEvent::Release) {
+                if (event == tsl::elm::TouchEvent::Touch) {
+                    touchInSliderBounds = true;
+                    triggerNavigationFeedback();
+                } else if (event == tsl::elm::TouchEvent::Release) {
+                    touchInSliderBounds = false;
                     const bool stillInIcon =
                         (currX >= this->getX() + 20 && currX <= this->getX() + 85 &&
                          currY >= this->getY() + 12  && currY <= this->getY() + 75);
@@ -103,8 +107,6 @@ public:
                         tsl::shiftItemFocus(this);
                         triggerNavigationFeedback();
                     }
-                } else if (event == tsl::elm::TouchEvent::Touch) {
-                    triggerNavigationFeedback();
                 }
                 return true; // consume so the slider doesn't also react
             }
