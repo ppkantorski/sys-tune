@@ -473,11 +473,16 @@ namespace tune::impl {
                     SetTitleVolume(std::clamp(config::get_title_volume(new_tid), 0.f, VOLUME_MAX));
                 }
 
-                // TODO(TJ): fade song in rather than abruptly playing to avoid jump scares
                 if (config::has_title_enabled(new_tid)) {
-                    g_should_pause = !config::get_title_enabled(new_tid);
+                    // Only pause if the per-title config says to pause.
+                    // Never force-play — respect whatever state the player is already in.
+                    if (!config::get_title_enabled(new_tid)) {
+                        g_should_pause = true;
+                    }
                 } else {
-                    g_should_pause = !config::get_title_enabled_default();
+                    if (!config::get_title_enabled_default()) {
+                        g_should_pause = true;
+                    }
                 }
             }
 
