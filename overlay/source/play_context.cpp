@@ -2,6 +2,7 @@
 
 #include "tune.h"
 
+#include <tesla.hpp>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -276,6 +277,11 @@ bool playlistTuneClearQueue() {
 // ---- Lifecycle -------------------------------------------------------------
 
 void init() {
+    // Detect expanded memory early so wallpaper and other memory-dependent
+    // features are correctly gated from the very first overlay frame.
+    ult::currentHeapSize = ult::getCurrentHeapSize();
+    ult::expandedMemory  = ult::currentHeapSize >= ult::OverlayHeapSize::Size_8MB;
+
     readState();
 
     // Load saved[] from disk (authoritative user playlist).
@@ -366,6 +372,63 @@ void poll() {
         // IPC returned no track.  Only blank current if no switch is pending.
         if (g_pending_path[0] == '\0')
             g_current_path[0] = '\0';
+    }
+
+    // Per-folder wallpaper — runs in every poll() so it fires regardless of
+    // which page (player, browser, playlist) is currently visible.
+    // Uses the pending path when a switch is in flight so the wallpaper
+    // updates at the same moment the UI shows the new track, not after IPC
+    // confirms it.  Gated by s_last_wallpaper_folder so reloadWallpaper()
+    // is only called when the folder actually changes.
+    if (ult::expandedMemory) {
+        const char *cur = g_pending_path[0] != '\0' ? g_pending_path : g_current_path;
+        checkWallpaper(cur);
+    }
+}
+
+void checkWallpaper(const char *path) {
+    if (!ult::expandedMemory) return;
+
+    static std::string s_default_wallpaper_path;
+    static bool        s_default_captured = false;
+    static std::string s_last_wallpaper_folder;
+    // Debounce: number of consecutive no-song calls before restoring default.
+    // checkWallpaper is called every tick from StatusBar::update(), so 90 ticks
+    // is ~1.5 s at 60 fps — long enough to survive any between-track gap but
+    // short enough to restore promptly when playback actually stops.
+    static u8          s_no_song_ticks    = 0;
+    static constexpr u8 kNoSongDebounce   = 90;
+
+    if (!s_default_captured) {
+        s_default_wallpaper_path = ult::WALLPAPER_PATH;
+        s_default_captured       = true;
+    }
+
+    if (path && path[0] != '\0') {
+        s_no_song_ticks = 0;  // song is present — reset debounce
+
+        std::string song_folder;
+        const char *slash = std::strrchr(path, '/');
+        if (slash)
+            song_folder.assign(path, static_cast<size_t>(slash + 1 - path));
+
+        if (song_folder != s_last_wallpaper_folder) {
+            s_last_wallpaper_folder = song_folder;
+            const std::string candidate = song_folder + "wallpaper.rgba";
+            ult::WALLPAPER_PATH = ult::isFile(candidate)
+                ? candidate
+                : s_default_wallpaper_path;
+            ult::reloadWallpaper();
+        }
+    } else if (!s_last_wallpaper_folder.empty()) {
+        // No song — only restore the default once the absence has persisted
+        // long enough to distinguish "between tracks" from "stopped".
+        if (++s_no_song_ticks >= kNoSongDebounce) {
+            s_no_song_ticks = 0;
+            s_last_wallpaper_folder.clear();
+            ult::WALLPAPER_PATH = s_default_wallpaper_path;
+            ult::reloadWallpaper();
+        }
     }
 }
 

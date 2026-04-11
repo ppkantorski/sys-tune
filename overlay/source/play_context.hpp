@@ -83,6 +83,12 @@ namespace play_ctx {
     // Call periodically from each Gui's update() (≈every 15 ticks).
     void poll();
 
+    // Check whether the current song's folder has a wallpaper.rgba and reload
+    // ult::WALLPAPER_PATH if it has changed.  Safe to call from any Gui's
+    // update() — internally gated so reloadWallpaper() only fires on folder
+    // changes.  path must be the full absolute path to the current audio file.
+    void checkWallpaper(const char *path);
+
     // Re-snapshot the IPC queue order into saved[] and persist to disk.
     // Call after toggling shuffle so the Playlist/Browser lists reflect the
     // new order the service has applied before the user navigates there.

@@ -125,10 +125,12 @@ tsl::elm::Element* MainGui::createUI() {
 
 // ---------------------------------------------------------------------------
 void MainGui::update() {
-    static u8 tick = 0;
-    if ((tick % 15) == 0)
-        m_status_bar->update();
-    ++tick;
+    //static u8 tick = 0;
+    //if ((tick % 15) == 0)
+    m_status_bar->update();
+    //if ((tick % 15) == 8)   // stagger from status_bar: fires midway between its updates
+    play_ctx::poll();
+    //++tick;
 
     // Detect shuffle mode changes and immediately resync g_saved to the
     // service's new queue order (the IPC call is synchronous so by the time
@@ -138,13 +140,13 @@ void MainGui::update() {
     if (play_ctx::source() == play_ctx::Source::Playlist) {
         static TuneShuffleMode s_last_shuffle = TuneShuffleMode_Off;
         TuneShuffleMode cur = TuneShuffleMode_Off;
-        if ((tick % 15) == 1) {  // stagger slightly from status_bar update
-            tuneGetShuffleMode(&cur);
-            if (cur != s_last_shuffle) {
-                s_last_shuffle = cur;
-                play_ctx::resyncFromIPC();
-            }
+        //if ((tick % 15) == 1) {  // stagger slightly from status_bar update
+        tuneGetShuffleMode(&cur);
+        if (cur != s_last_shuffle) {
+            s_last_shuffle = cur;
+            play_ctx::resyncFromIPC();
         }
+        //}
     }
 
     const std::string newLabel =
@@ -483,9 +485,9 @@ void SettingsGui::update() {
     /* Poll IPC on a throttled schedule — it's a syscall.
        Button label updates run every tick so values snap back instantly
        the moment SettingsGui resumes after a child GUI is popped. */
-    static u8 tick = 0;
-    if ((++tick % 15) == 0)
-        play_ctx::poll();
+    //static u8 tick = 0;
+    //if ((++tick % 15) == 0)
+    play_ctx::poll();
 
     // Re-check the running title every tick (cheap — just reads globals set by
     // pm::getCurrentPidTid which was already called recently by play_ctx::poll).

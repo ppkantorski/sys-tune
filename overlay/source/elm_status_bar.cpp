@@ -8,6 +8,7 @@
 #include "elm_status_bar.hpp"
 #include "symbol.hpp"
 #include "config/config.hpp"
+#include "play_context.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -866,10 +867,15 @@ void StatusBar::update() {
     if (pending != UINT32_MAX)
         tuneSeek(pending);
 
+    // Tracks consecutive ticks with no IPC track — used to debounce art
+    // teardown so the between-track gap doesn't flash the placeholder.
+    static u8 s_no_song_ticks = 0;
+
     if (R_FAILED(tuneGetStatus(&this->m_playing)))
         this->m_playing = false;
 
     if (R_SUCCEEDED(tuneGetCurrentQueueItem(path_buffer, FS_MAX_PATH, &this->m_stats))) {
+        s_no_song_ticks = 0;  // song present — reset debounce
         const size_t length = std::strlen(path_buffer);
         char fullPath[FS_MAX_PATH];
         memcpy(fullPath, path_buffer, length + 1);
@@ -891,24 +897,42 @@ void StatusBar::update() {
             if (loadArt(fullPath))
                 m_last_full_path = fullPath;
         }
+
+        // Always check wallpaper using the freshly-read fullPath so the player
+        // page reacts immediately (StatusBar::update() fires every 15 ticks
+        // with a direct IPC read, no poll() needed on this path).
+        play_ctx::checkWallpaper(fullPath);
     } else {
-        if (!m_last_full_path.empty()) {
+        // Debounce art teardown to avoid the placeholder flash during the
+        // brief gap between tracks where the sysmodule has closed the old
+        // source but not yet opened the new one.  Title/stats clear
+        // immediately (text reset is less jarring); art is held for a few
+        // ticks so the old frame keeps displaying through the transition.
+        // Once the new song is detected, loadArt() replaces it atomically
+        // within the same update() call before draw() runs.
+        if (!m_last_full_path.empty() && ++s_no_song_ticks >= 10) {
+            s_no_song_ticks = 0;
             m_last_full_path.clear();
             m_art_path.clear();
             m_art_valid       = false;
             m_art_scaled_size = 0;
             m_art_rgba4444.clear();
             m_art_rgba4444.shrink_to_fit();
+            // Title and artist strings held through the between-track gap;
+            // only cleared once we're confident nothing is playing.
+            m_song_title_str  = "";
+            m_artist_str      = "";
         }
-        m_song_title_str      = "";   /* ⋯ */
-        m_artist_str          = "";
-        m_text_width          = 0;
-        m_artist_width        = 0;
-        m_scroll_offset       = 0;
-        m_counter             = 0;
+        // Scroll/layout state always reset each else-tick so draw() never
+        // inherits a stale offset or truncation flag — these are fast and
+        // safe to recalculate from the (possibly held) strings every frame.
+        m_text_width           = 0;
+        m_artist_width         = 0;
+        m_scroll_offset        = 0;
+        m_counter              = 0;
         m_artist_scroll_offset = 0;
-        m_artist_counter      = 0;
-        m_artist_truncated    = false;
+        m_artist_counter       = 0;
+        m_artist_truncated     = false;
         this->m_stats    = {};
     }
 
