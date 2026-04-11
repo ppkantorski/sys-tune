@@ -289,7 +289,7 @@ tsl::elm::Element* SettingsGui::createUI() {
 
     m_queue_button->setClickListener([this](u64 keys) -> bool {
         if (keys & HidNpadButton_A) {
-            tsl::shiftItemFocus(m_queue_button);
+            //tsl::shiftItemFocus(m_queue_button);
             tsl::changeTo<PlaylistGui>([this](u32 count) {
                 refreshPlaylistCount(count);
             });
@@ -305,7 +305,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     m_browser_button = browser_button;
     browser_button->setClickListener([this, browser_button](u64 keys) -> bool {
         if (keys & HidNpadButton_A) {
-            tsl::shiftItemFocus(browser_button);
+            //tsl::shiftItemFocus(browser_button);
             tsl::changeTo<BrowserGui>("", "", "", [this](u32 count) {
                 refreshPlaylistCount(count);
             });
@@ -416,7 +416,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     // Label shows the current tid for context; value always reflects the true default.
     auto tune_default_play = new tsl::elm::ToggleListItem("Pause On Start", !config::get_title_enabled_default(), "On", "Off");
     tune_default_play->setStateChangedListener([tune_default_play, this](bool v) {
-        tsl::shiftItemFocus(tune_default_play);
+        //tsl::shiftItemFocus(tune_default_play);
         config::set_title_enabled_default(!v);
         if (m_tid) config::set_title_enabled(m_tid, !v);
     });
@@ -429,7 +429,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     // Per-title: should music autoplay when THIS specific game launches?
     auto tune_play = new tsl::elm::ToggleListItem("Auto-play Startup", config::get_title_enabled(tid), "On", "Off");
     tune_play->setStateChangedListener([tune_play, tid](bool v) {
-        tsl::shiftItemFocus(tune_play);
+        //tsl::shiftItemFocus(tune_play);
         config::set_title_enabled(tid, v);
     });
     m_list->addItem(tune_play);
@@ -437,7 +437,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     auto startup_button = new tsl::elm::ListItem("Remove Startup");
     startup_button->setClickListener([this, startup_button](u64 keys) -> bool {
         if (keys & HidNpadButton_A) {
-            tsl::shiftItemFocus(startup_button);
+            //tsl::shiftItemFocus(startup_button);
             char path[512];
             if (config::get_load_path(path, sizeof(path))) {
                 config::set_load_path("");
@@ -456,7 +456,12 @@ tsl::elm::Element* SettingsGui::createUI() {
     auto exit_button = new tsl::elm::ListItem("Stop sys-tune");
     exit_button->setValue("\uE071", true);
     exit_button->setClickListener([exit_button](u64 keys) -> bool {
-        if (keys & HidNpadButton_A) { tsl::shiftItemFocus(exit_button); tuneQuit(); tsl::goBack(); return true; }
+        if (keys & HidNpadButton_A) {
+            //tsl::shiftItemFocus(exit_button);
+            tuneQuit();
+            tsl::goBack();
+            return true;
+        }
         return false;
     });
     m_list->addItem(exit_button);

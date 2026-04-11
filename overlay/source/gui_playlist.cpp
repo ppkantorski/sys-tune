@@ -181,7 +181,7 @@ namespace {
                 if (Element::getInputMode() == tsl::InputMode::Touch) {
                     m_clickAnimationProgress = 0;
                     const bool handled = onClick(HidNpadButton_A);
-                    if (handled) tsl::shiftItemFocus(this);
+                    //if (handled) tsl::shiftItemFocus(this);
                     return handled;
                 }
             }

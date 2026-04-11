@@ -196,7 +196,7 @@ namespace {
                 if (Element::getInputMode() == tsl::InputMode::Touch) {
                     m_clickAnimationProgress = 0;
                     const bool handled = onClick(HidNpadButton_A);
-                    if (handled) tsl::shiftItemFocus(this);
+                    //if (handled) tsl::shiftItemFocus(this);
                     return handled;
                 }
             }
@@ -254,7 +254,7 @@ namespace {
                 if (Element::getInputMode() == tsl::InputMode::Touch) {
                     m_clickAnimationProgress = 0;
                     const bool handled = onClick(HidNpadButton_A);
-                    if (handled) tsl::shiftItemFocus(this);
+                    //if (handled) tsl::shiftItemFocus(this);
                     return handled;
                 }
             }
@@ -390,7 +390,7 @@ void BrowserGui::buildList() {
             auto *item = new BrowserFolderItem(ent->d_name, sub_path);
             item->setClickListener([this, item, sub_path, root_copy](u64 down) -> bool {
                 if (down & HidNpadButton_A) {
-                    tsl::shiftItemFocus(item);
+                    //tsl::shiftItemFocus(item);
                     // swapTo keeps the stack at constant depth [SettingsGui, BrowserGui].
                     // focus_name="" — we're entering, not returning, so no item to focus.
                     tsl::swapTo<BrowserGui>(sub_path, "", root_copy, m_on_count_changed);
