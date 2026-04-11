@@ -211,10 +211,19 @@ bool switchToFolder(const std::string& folder_path,
 
     // Fast path: already playing from this exact folder — the IPC queue is
     // already loaded correctly.  Just seek to the new index and resume.
+    // Guard with a count check: after a sysmodule restart the queue may only
+    // hold a single startup file rather than the full folder, so a mismatch
+    // means we must fall through to a full reload instead of seeking within
+    // a truncated queue.
     if (g_source == Source::Folder && g_folder_path == folder_path) {
-        tuneSelect(idx);
-        tunePlay();
-        return true;
+        u32 ipc_count = 0;
+        tuneGetPlaylistSize(&ipc_count);
+        if (ipc_count == static_cast<u32>(songs.size())) {
+            tuneSelect(idx);
+            tunePlay();
+            return true;
+        }
+        // Count mismatch — fall through to full reload below.
     }
 
     // Transitioning FROM Playlist context: snapshot IPC to saved[] first.
@@ -289,6 +298,22 @@ void init() {
     // fall back to Playlist context so the saved playlist is usable immediately.
     u32 ipc_count = 0;
     tuneGetPlaylistSize(&ipc_count);
+
+    // If we think we're in Folder context, verify IPC was actually populated
+    // with that folder's songs and not a single startup file.  After a
+    // sysmodule restart load_path may be one file rather than the full folder,
+    // leaving IPC with just that one track while play_source.txt still says
+    // Folder context.  Check the first IPC path: if it doesn't begin with
+    // g_folder_path the persisted context is stale — reset to Playlist.
+    if (g_source == Source::Folder && ipc_count > 0 && !g_folder_path.empty()) {
+        char probe[FS_MAX_PATH] = "";
+        tuneGetPlaylistItem(0, probe, sizeof(probe));
+        if (strncmp(probe, g_folder_path.c_str(), g_folder_path.size()) != 0) {
+            g_source = Source::Playlist;
+            g_folder_path.clear();
+            writeState();
+        }
+    }
 
     if (ipc_count == 0 && !g_saved.empty()) {
         if (g_source == Source::Folder) {
