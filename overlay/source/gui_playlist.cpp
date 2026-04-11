@@ -360,8 +360,11 @@ PlaylistGui::PlaylistGui(std::function<void(u32)> on_count_changed)
             } else if (keys & KEY_MINUS) {
                 // Use saved[] path directly — it's the authoritative source.
                 const auto &sp = play_ctx::savedPlaylist();
-                if ((size_t)tune_index < sp.size())
+                if ((size_t)tune_index < sp.size()) {
                     config::set_load_path(sp[tune_index].c_str());
+                    if (tsl::notification)
+                        tsl::notification->showNow(item->getText(), 26, "Startup File Set", 2500, false);
+                }
                 return true;
             }
             return false;
