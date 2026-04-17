@@ -238,6 +238,11 @@ namespace tune::impl {
         constexpr auto AUDIO_LATENCY_MS    = 42;
         constexpr auto AUDIO_BUFFER_SIZE   = AUDIO_FREQ / 1000 * AUDIO_LATENCY_MS * AUDIO_CHANNEL_COUNT;
 
+        /* Title-transition fade parameters.
+         * 50 steps × 20 ms = 1 000 ms total ramp time. */
+        constexpr int  kFadeSteps           = 100;
+        constexpr u64  kFadeStepIntervalNs  = 5'000'000ULL;
+
         AudioOutBuffer g_audout_buffer[AUDIO_BUFFER_COUNT];
         alignas(0x1000) s16 AudioMemoryPool[AUDIO_BUFFER_COUNT][(AUDIO_BUFFER_SIZE + 0xFFF) & ~0xFFF];
         static_assert((sizeof(AudioMemoryPool[0]) % 0x2000) == 0, "Audio Memory pool needs to be page aligned!");
@@ -764,9 +769,68 @@ namespace tune::impl {
                                  * play — that IS their stated intent, so it
                                  * overrides any prior manual pause veto. */
                                 g_user_paused = false;
-                                policyWrite(false);
-                            } else if (action == StartAction::ForcePause)
-                                policyWrite(true);
+
+                                if (g_should_pause) {
+                                    /* Music was paused before this title launched.
+                                     * Fade in over 1 s so playback doesn't abruptly
+                                     * interrupt the game's own audio ramp-up.
+                                     *
+                                     * Steps:
+                                     *  1. Snapshot the user's configured volume.
+                                     *  2. Drop audout to silence (before unpausing
+                                     *     so the decode loop never emits full-volume
+                                     *     samples on its first iteration).
+                                     *  3. Unpause — the decode loop starts filling
+                                     *     buffers immediately but at volume 0.
+                                     *  4. Ramp up to the configured volume over
+                                     *     kFadeSteps × kFadeStepIntervalNs. */
+                                    float target = GetVolume();
+                                    audoutSetAudioOutVolume(0.f);
+                                    policyWrite(false);
+                                    for (int i = 1; i <= kFadeSteps && g_should_run; ++i) {
+                                        audoutSetAudioOutVolume(
+                                            target * (static_cast<float>(i) / kFadeSteps));
+                                        svcSleepThread(kFadeStepIntervalNs);
+                                    }
+                                    /* Guarantee the exact configured level at the end
+                                     * (avoids any floating-point rounding residual). */
+                                    audoutSetAudioOutVolume(target);
+                                } else {
+                                    /* Music was already playing — no fade needed;
+                                     * the listener already hears it at full volume. */
+                                    policyWrite(false);
+                                }
+                            } else if (action == StartAction::ForcePause) {
+                                if (!g_should_pause) {
+                                    /* Music was playing before this title launched.
+                                     * Fade out over 1 s, then pause.
+                                     *
+                                     * Steps:
+                                     *  1. Snapshot the user's configured volume.
+                                     *  2. Ramp down to silence over kFadeSteps.
+                                     *  3. Pause — the decode loop stops consuming
+                                     *     buffers.
+                                     *  4. Restore the configured volume so the next
+                                     *     unpause (e.g. Play button) comes back at
+                                     *     the right level, not silence. */
+                                    float vol = GetVolume();
+                                    for (int i = kFadeSteps - 1; i >= 0 && g_should_run; --i) {
+                                        audoutSetAudioOutVolume(
+                                            vol * (static_cast<float>(i) / kFadeSteps));
+                                        svcSleepThread(kFadeStepIntervalNs);
+                                    }
+                                    /* Keep at 0 while issuing the pause so the
+                                     * decode loop stops at silence, then restore
+                                     * the configured level so the next unpause
+                                     * (e.g. Play button) comes back at full
+                                     * volume rather than staying muted. */
+                                    policyWrite(true);
+                                    audoutSetAudioOutVolume(vol); // restore after pause
+                                } else {
+                                    /* Already paused — nothing to fade. */
+                                    policyWrite(true);
+                                }
+                            }
                             /* DoNothing: leave g_should_pause as-is. */
                         }
 
