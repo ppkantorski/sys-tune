@@ -55,6 +55,57 @@ void setBrowserReturnPath(const std::string& cwd, const std::string& root) {
 }
 
 // ---------------------------------------------------------------------------
+// Tri-state focus action used by the "Title Focus" and "Custom Focus"
+// cycling list items in SettingsGui.
+//
+//   Pass  — policy engine takes no action at title focus transitions
+//           (music simply keeps doing whatever it was doing).
+//   Play  — force music to play.
+//   Pause — force music to pause.
+//
+// A KEY_A press cycles: Pass -> Play -> Pause -> Pass -> ...
+//
+// Storage is unchanged from the previous pair-of-toggles UI — each list
+// item maps to two mutually-exclusive bool keys in config.ini — so
+// existing user configs are fully backward compatible.
+// ---------------------------------------------------------------------------
+namespace {
+    enum class FocusMode { Pass, Play, Pause };
+
+    constexpr const char* focusLabel(FocusMode m) {
+        switch (m) {
+            case FocusMode::Play:  return "Play";
+            case FocusMode::Pause: return "Pause";
+            case FocusMode::Pass:
+            default:               return "Pass";
+        }
+    }
+
+    constexpr FocusMode focusNext(FocusMode m) {
+        switch (m) {
+            case FocusMode::Pass:  return FocusMode::Play;
+            case FocusMode::Play:  return FocusMode::Pause;
+            case FocusMode::Pause:
+            default:               return FocusMode::Pass;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deferred SettingsGui rebuild — set by the "Default Focus" toggle listener
+// and consumed at the top of SettingsGui::update() on the next frame.
+//
+// We CANNOT call tsl::swapTo from inside a setStateChangedListener because
+// swapTo immediately destroys the current GUI (and therefore the element
+// whose onClick is still on the call stack), causing a use-after-free on the
+// triggerClickAnimation() and Element::onClick() calls that follow the
+// listener invocation.  Deferring to update() lets the full input chain
+// unwind safely before the rebuild fires.
+// ---------------------------------------------------------------------------
+static bool        s_settings_rebuild_pending = false;
+static std::string s_settings_rebuild_jump;
+
+// ---------------------------------------------------------------------------
 // Return to the exact browser directory the user was in.
 // The stack is always [SettingsGui, BrowserGui] — one changeTo is enough.
 // Pressing B inside BrowserGui swaps to the parent directory, so the full
@@ -390,10 +441,10 @@ tsl::elm::Element* SettingsGui::createUI() {
     //   - It has no per-game volume to tune, so "Preset Volume" is a no-op.
     //   - Its tid is a well-known constant rather than meaningful per-game info,
     //     so the "Title ID" header is noise.
-    //   - The default "Pause On Start" fallback is irrelevant at HOME because
-    //     HOME always has an explicit per-title entry (set via the dedicated
+    //   - Default Focus / Custom Focus are irrelevant at HOME because HOME
+    //     always has an explicit per-title entry (set via the dedicated
     //     "Pause On Home" toggle added below).
-    // Hide those three widgets when the current tid is HOME.
+    // Hide those widgets when the current tid is HOME.
     constexpr u64 kHomeScreenTid = 0x0100000000001000ULL;
     const bool at_home = (tid == kHomeScreenTid);
 
@@ -426,75 +477,194 @@ tsl::elm::Element* SettingsGui::createUI() {
             }));
         m_list->addItem(default_title_volume_slider);
 
-        // ---- Per-title start-up policy (tri-state: Play / Pause / Neither) ----
+        // ---- Per-title start-up policy ----
         //
-        // Play On Start and Pause On Start are mutually exclusive:
-        // turning one ON forces the other OFF. If both are OFF, the
-        // policy engine takes no action at title transition — music
-        // simply keeps doing whatever it was doing before the switch.
+        // Two widgets work together:
         //
-        // Storage:
-        //   Play On Start  -> config::title_enabled(tid) = true
-        //   Pause On Start -> config::title_pause_on_start(tid) = true
-        //   Neither        -> both keys absent/false
+        //   Default Focus  (toggle) — when ON (the factory default), this
+        //                             title defers to the global "Title
+        //                             Focus" setting in Miscellaneous.
+        //                             Turn it OFF to expose the per-title
+        //                             "Custom Focus" override below.
         //
-        // Forward declare pointers so each listener can toggle the other.
-        tsl::elm::ToggleListItem *play_on_start  = nullptr;
-        tsl::elm::ToggleListItem *pause_on_start = nullptr;
-
-        const bool init_play  = config::has_title_enabled(tid) && config::get_title_enabled(tid);
-        const bool init_pause = config::has_title_pause_on_start(tid) && config::get_title_pause_on_start(tid);
-
-        play_on_start = new tsl::elm::ToggleListItem("Play On Start", init_play, "On", "Off");
-        pause_on_start = new tsl::elm::ToggleListItem("Pause On Start", init_pause, "On", "Off");
-
-        play_on_start->setStateChangedListener([pause_on_start, tid](bool v) {
-            if (v) {
-                /* Turning Play On Start ON — persist and force the
-                 * opposite toggle OFF. */
-                config::set_title_enabled(tid, true);
-                config::clear_title_pause_on_start(tid);
-                if (pause_on_start) pause_on_start->setState(false);
-            } else {
-                /* Turning Play On Start OFF — clear the key entirely
-                 * rather than writing false, so the tri-state resolver
-                 * sees "no action configured". */
-                config::clear_title_enabled(tid);
-            }
+        //   Custom Focus  (tri-state cycle: Pass / Play / Pause) — only
+        //                             shown when Default Focus is OFF.
+        //                             Each KEY_A press cycles the state.
+        //                             Storage:
+        //
+        //                               Pass  -> both keys absent
+        //                               Play  -> title_enabled(tid) = true
+        //                               Pause -> title_pause_on_start(tid) = true
+        //
+        // The underlying config keys (title_enabled /
+        // title_pause_on_start / default_on_start) are unchanged from the
+        // previous pair-of-toggles UI, so existing configs are fully
+        // backward compatible.
+        //
+        // Toggling Default Focus does a deferred swapTo<SettingsGui> so
+        // the list is rebuilt immediately: the Custom Focus row appears
+        // or disappears without any stale state.
+        const bool init_default_focus = config::get_default_on_start(tid);
+        auto default_focus = new tsl::elm::ToggleListItem(
+            "Default Focus", init_default_focus, "On", "Off");
+        default_focus->setStateChangedListener([tid](bool v) {
+            config::set_default_on_start(tid, v);
+            // Defer the rebuild to SettingsGui::update() so the full
+            // onClick/handleInput call stack unwinds before swapTo fires.
+            // Calling swapTo here directly would destroy the element while
+            // its own onClick is still on the stack (use-after-free).
+            s_settings_rebuild_pending = true;
+            s_settings_rebuild_jump    = "Default Focus";
         });
+        m_list->addItem(default_focus);
 
-        pause_on_start->setStateChangedListener([play_on_start, tid](bool v) {
-            if (v) {
-                config::set_title_pause_on_start(tid, true);
-                config::clear_title_enabled(tid);
-                if (play_on_start) play_on_start->setState(false);
-            } else {
-                config::clear_title_pause_on_start(tid);
-            }
-        });
+        // Only expose the per-title override when the user has opted out
+        // of the global default — keeps the list clean by default.
+        if (!init_default_focus) {
+            // Pause takes priority over Play if both keys are somehow set
+            // (matches resolvePerTitlePolicy's per-title order in
+            // music_player.cpp).
+            FocusMode initial = FocusMode::Pass;
+            if (config::has_title_pause_on_start(tid) && config::get_title_pause_on_start(tid))
+                initial = FocusMode::Pause;
+            else if (config::has_title_enabled(tid) && config::get_title_enabled(tid))
+                initial = FocusMode::Play;
 
-        m_list->addItem(play_on_start);
-        m_list->addItem(pause_on_start);
+            auto *custom_focus = new tsl::elm::ListItem("Custom Focus", focusLabel(initial));
+            // Render "Pass" faintly so it reads as "inactive", mirroring
+            // how a ToggleListItem renders its OFF value.
+            custom_focus->setValue(focusLabel(initial), initial == FocusMode::Pass);
+            custom_focus->setClickListener(
+                [custom_focus, state = initial, tid](u64 keys) mutable -> bool {
+                    if (keys & HidNpadButton_A) {
+                        state = focusNext(state);
+                        switch (state) {
+                            case FocusMode::Play:
+                                config::set_title_enabled(tid, true);
+                                config::clear_title_pause_on_start(tid);
+                                break;
+                            case FocusMode::Pause:
+                                config::clear_title_enabled(tid);
+                                config::set_title_pause_on_start(tid, true);
+                                break;
+                            case FocusMode::Pass:
+                            default:
+                                config::clear_title_enabled(tid);
+                                config::clear_title_pause_on_start(tid);
+                                break;
+                        }
+                        custom_focus->setValue(focusLabel(state),
+                                               state == FocusMode::Pass);
+                        return true;
+                    }
+                    return false;
+                });
+            m_list->addItem(custom_focus);
+        }
     }
 
     // ---- Misc ----
     m_list->addItem(new tsl::elm::CategoryHeader("Miscellaneous"));
 
-    // Pause On Home — dedicated per-title control for the HOME menu.
-    // Always visible regardless of what title is running. Uses the
-    // dedicated "title_pause_on_start" storage for consistency with
-    // the per-title Pause On Start semantics above.
-    auto pause_on_home = new tsl::elm::ToggleListItem(
-        "Pause On Home",
-        config::has_title_pause_on_start(kHomeScreenTid) && config::get_title_pause_on_start(kHomeScreenTid),
-        "On", "Off");
-    pause_on_home->setStateChangedListener([tid_home = kHomeScreenTid](bool v) {
-        if (v)
-            config::set_title_pause_on_start(tid_home, true);
-        else
-            config::clear_title_pause_on_start(tid_home);
-    });
-    m_list->addItem(pause_on_home);
+    // Title Focus — global default applied to any title whose per-title
+    // "Default Focus" is ON (the factory default). Cycling tri-state:
+    //
+    //   Pass  — no policy action on title focus transitions
+    //           (music simply keeps doing whatever it was doing).
+    //   Play  — force music to play on every title focus transition.
+    //   Pause — force music to pause on every title focus transition.
+    //
+    // Storage is unchanged (two mutually-exclusive bool keys,
+    // play_on_title / pause_on_title). The cycling widget just replaces
+    // the previous pair of ON/OFF toggles with a single list item.
+    //
+    // Sits at the top of Miscellaneous so the user can set the
+    // system-wide behaviour before drilling into per-title overrides.
+    {
+        // Pause takes priority over Play if both keys are somehow set
+        // (matches resolvePerTitlePolicy's global order in music_player.cpp).
+        FocusMode initial = FocusMode::Pass;
+        if (config::get_pause_on_title())
+            initial = FocusMode::Pause;
+        else if (config::get_play_on_title())
+            initial = FocusMode::Play;
+
+        auto *title_focus = new tsl::elm::ListItem("Title Focus", focusLabel(initial));
+        title_focus->setValue(focusLabel(initial), initial == FocusMode::Pass);
+        title_focus->setClickListener(
+            [title_focus, state = initial](u64 keys) mutable -> bool {
+                if (keys & HidNpadButton_A) {
+                    state = focusNext(state);
+                    switch (state) {
+                        case FocusMode::Play:
+                            config::set_play_on_title(true);
+                            config::set_pause_on_title(false);
+                            break;
+                        case FocusMode::Pause:
+                            config::set_play_on_title(false);
+                            config::set_pause_on_title(true);
+                            break;
+                        case FocusMode::Pass:
+                        default:
+                            config::set_play_on_title(false);
+                            config::set_pause_on_title(false);
+                            break;
+                    }
+                    title_focus->setValue(focusLabel(state),
+                                          state == FocusMode::Pass);
+                    return true;
+                }
+                return false;
+            });
+        m_list->addItem(title_focus);
+    }
+
+    // Home Focus — cycling tri-state for the HOME menu press.
+    // Always visible regardless of what title is running.
+    //
+    //   Pass  → no action when pressing HOME (music keeps its current state).
+    //   Play  → music plays  when pressing HOME.
+    //   Pause → music pauses when pressing HOME.
+    //
+    // Storage uses the same two mutually-exclusive keys as Custom Focus:
+    //   Play  → title_enabled(kHomeScreenTid)        = true
+    //   Pause → title_pause_on_start(kHomeScreenTid) = true
+    //   Pass  → both keys absent
+    {
+        FocusMode home_initial = FocusMode::Pass;
+        if (config::has_title_pause_on_start(kHomeScreenTid) && config::get_title_pause_on_start(kHomeScreenTid))
+            home_initial = FocusMode::Pause;
+        else if (config::has_title_enabled(kHomeScreenTid) && config::get_title_enabled(kHomeScreenTid))
+            home_initial = FocusMode::Play;
+
+        auto *home_focus = new tsl::elm::ListItem("Home Focus", focusLabel(home_initial));
+        home_focus->setValue(focusLabel(home_initial), home_initial == FocusMode::Pass);
+        home_focus->setClickListener(
+            [home_focus, state = home_initial](u64 keys) mutable -> bool {
+                if (keys & HidNpadButton_A) {
+                    state = focusNext(state);
+                    switch (state) {
+                        case FocusMode::Play:
+                            config::set_title_enabled(kHomeScreenTid, true);
+                            config::clear_title_pause_on_start(kHomeScreenTid);
+                            break;
+                        case FocusMode::Pause:
+                            config::clear_title_enabled(kHomeScreenTid);
+                            config::set_title_pause_on_start(kHomeScreenTid, true);
+                            break;
+                        case FocusMode::Pass:
+                        default:
+                            config::clear_title_enabled(kHomeScreenTid);
+                            config::clear_title_pause_on_start(kHomeScreenTid);
+                            break;
+                    }
+                    home_focus->setValue(focusLabel(state), state == FocusMode::Pass);
+                    return true;
+                }
+                return false;
+            });
+        m_list->addItem(home_focus);
+    }
 
     // Auto-play Startup — applies to the sysmodule itself, not any
     // individual title. When ON, music begins playing as soon as the
@@ -545,16 +715,29 @@ tsl::elm::Element* SettingsGui::createUI() {
 
     // Auto-jump to whichever music source is actively playing so the user
     // lands directly on the relevant button rather than the first item.
-    if (init_inPlaylist && init_hasTrack)
+    if (!m_jump_to.empty()) {
+        m_list->jumpToItem(m_jump_to);
+    } else if (init_inPlaylist && init_hasTrack) {
         m_list->jumpToItem("Playlist");
-    else if (init_inFolder && init_hasTrack)
+    } else if (init_inFolder && init_hasTrack) {
         m_list->jumpToItem("Browse");
+    }
 
     return m_frame;
 }
 
 // ---------------------------------------------------------------------------
 void SettingsGui::update() {
+    // Consume any pending rebuild request.  This is set by the "Default On
+    // Start" listener and intentionally deferred here so the swapTo fires
+    // after the full onClick/handleInput chain has returned — not while the
+    // toggle element is still mid-callback.
+    if (s_settings_rebuild_pending) {
+        s_settings_rebuild_pending = false;
+        tsl::swapTo<SettingsGui>(std::move(s_settings_rebuild_jump));
+        return;
+    }
+
     /* Poll IPC on a throttled schedule — it's a syscall.
        Button label updates run every tick so values snap back instantly
        the moment SettingsGui resumes after a child GUI is popped. */

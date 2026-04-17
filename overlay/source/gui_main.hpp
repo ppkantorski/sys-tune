@@ -52,6 +52,14 @@ private:
 class SettingsGui final : public SysTuneGui {
 public:
     /**
+     * jumpTo — if non-empty, createUI() will call m_list->jumpToItem(jumpTo)
+     * at the end of construction.  Used by the "Default Focus" toggle to
+     * swapTo a fresh SettingsGui and land focus on that item after the list
+     * has been rebuilt with or without the Custom Focus row.
+     */
+    explicit SettingsGui(std::string jumpTo = {}) : m_jump_to(std::move(jumpTo)) {}
+
+    /**
      * Deletes m_list and all its children.
      * m_frame is owned by Tesla — do NOT delete here.
      */
@@ -67,6 +75,9 @@ private:
     // m_frame is owned by Tesla, do NOT delete.
     tsl::elm::List      *m_list         = nullptr;
     SysTuneOverlayFrame *m_frame        = nullptr;
+
+    // If set, createUI() calls m_list->jumpToItem(m_jump_to) at the end.
+    std::string          m_jump_to;
 
     // Pointers to the Playlist and Browse buttons so update() can set their
     // value labels live.  Both owned by m_list — do NOT delete here.
