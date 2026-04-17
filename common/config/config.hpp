@@ -16,14 +16,32 @@ void set_repeat(int value);
 auto get_volume() -> float;
 void set_volume(float value);
 
-// per title tune enable
+// per title tune enable (Play On Start — music plays when this title launches)
 auto has_title_enabled(u64 tid) -> bool;
 auto get_title_enabled(u64 tid) -> bool;
 void set_title_enabled(u64 tid, bool value);
 
-// default for tune for every title
+// per title Pause On Start — music pauses when this title launches.
+// Stored separately from title_enabled so the UI can offer a tri-state
+// (Play On Start, Pause On Start, or neither). The two are mutually
+// exclusive by convention enforced in the UI.
+auto has_title_pause_on_start(u64 tid) -> bool;
+auto get_title_pause_on_start(u64 tid) -> bool;
+void set_title_pause_on_start(u64 tid, bool value);
+void clear_title_pause_on_start(u64 tid);
+void clear_title_enabled(u64 tid);
+
+// default for tune for every title (LEGACY — kept for config-file
+// backward compatibility; no longer consulted by the policy engine).
 auto get_title_enabled_default() -> bool;
 void set_title_enabled_default(bool value);
+
+// Auto-play Startup — when the sysmodule first launches, start music
+// playing automatically if a startup playlist is set. Applies regardless
+// of which title is in foreground at boot; per-title Play On Start and
+// Pause On Start take over on subsequent title transitions.
+auto get_auto_play_startup() -> bool;
+void set_auto_play_startup(bool value);
 
 // per title volume
 auto has_title_volume(u64 tid) -> bool;

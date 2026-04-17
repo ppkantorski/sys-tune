@@ -65,6 +65,30 @@ void set_title_enabled(u64 tid, bool value) {
     ini_putl("title", get_tid_str(tid), value, CONFIG_PATH);
 }
 
+void clear_title_enabled(u64 tid) {
+    create_config_dir();
+    /* minIni: passing NULL as the value removes the key. */
+    ini_puts("title", get_tid_str(tid), nullptr, CONFIG_PATH);
+}
+
+auto has_title_pause_on_start(u64 tid) -> bool {
+    return ini_haskey("pause_on_start", get_tid_str(tid), CONFIG_PATH);
+}
+
+auto get_title_pause_on_start(u64 tid) -> bool {
+    return ini_getbool("pause_on_start", get_tid_str(tid), false, CONFIG_PATH);
+}
+
+void set_title_pause_on_start(u64 tid, bool value) {
+    create_config_dir();
+    ini_putl("pause_on_start", get_tid_str(tid), value, CONFIG_PATH);
+}
+
+void clear_title_pause_on_start(u64 tid) {
+    create_config_dir();
+    ini_puts("pause_on_start", get_tid_str(tid), nullptr, CONFIG_PATH);
+}
+
 auto get_title_enabled_default() -> bool {
     return ini_getbool("title", "default", true, CONFIG_PATH);
 }
@@ -72,6 +96,18 @@ auto get_title_enabled_default() -> bool {
 void set_title_enabled_default(bool value) {
     create_config_dir();
     ini_putl("title", "default", value, CONFIG_PATH);
+}
+
+auto get_auto_play_startup() -> bool {
+    /* Default true — matches the historical behaviour where the sysmodule
+     * would auto-play a startup playlist unless the running title had an
+     * explicit "disabled" entry. */
+    return ini_getbool("config", "auto_play_startup", true, CONFIG_PATH);
+}
+
+void set_auto_play_startup(bool value) {
+    create_config_dir();
+    ini_putl("config", "auto_play_startup", value, CONFIG_PATH);
 }
 
 auto has_title_volume(u64 tid) -> bool {
