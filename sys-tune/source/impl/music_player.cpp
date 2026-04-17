@@ -746,13 +746,29 @@ namespace tune::impl {
                         current_tid = new_tid;
                         first_poll  = false;
                     } else {
-                        /* Genuine title change. Apply the per-title policy. */
-                        const auto action = resolvePerTitlePolicy(new_tid);
-                        if (action == StartAction::ForcePlay)
-                            policyWrite(false);
-                        else if (action == StartAction::ForcePause)
-                            policyWrite(true);
-                        /* DoNothing: leave g_should_pause as-is. */
+                        /* Genuine title change.
+                         *
+                         * kHomeScreenTid is special: pmdmnt can report HOME
+                         * as the foreground process while the game is still
+                         * suspended in the background. HOME-related policy
+                         * (Pause On Home) is applied exclusively by the
+                         * focus-detection path below so we don't react to
+                         * stale title_enabled(HOME) keys that old config
+                         * files may contain, and don't double-fire policy.
+                         *
+                         * For every other title, apply Play/Pause On Start. */
+                        if (new_tid != kHomeScreenTid) {
+                            const auto action = resolvePerTitlePolicy(new_tid);
+                            if (action == StartAction::ForcePlay) {
+                                /* The user explicitly configured this title to
+                                 * play — that IS their stated intent, so it
+                                 * overrides any prior manual pause veto. */
+                                g_user_paused = false;
+                                policyWrite(false);
+                            } else if (action == StartAction::ForcePause)
+                                policyWrite(true);
+                            /* DoNothing: leave g_should_pause as-is. */
+                        }
 
                         current_tid  = new_tid;
                         last_focused = true;   // new foreground starts focused
@@ -781,9 +797,26 @@ namespace tune::impl {
                             /* DoNothing: leave playback state unchanged. */
                         } else {
                             /* Returned to the same game from HOME.
-                             * Restore snapshotted state (possibly updated
-                             * during the HOME visit by user actions). */
-                            policyWrite(g_saved_pause_state);
+                             *
+                             * Re-apply Play On Start / Pause On Start so that
+                             * coming back from HOME behaves the same as
+                             * entering the title fresh:
+                             *
+                             *   ForcePlay  → start playing (clears user-pause
+                             *                veto just like a title launch)
+                             *   ForcePause → pause
+                             *   DoNothing  → restore the state captured at
+                             *                focus-loss (continue whatever
+                             *                was happening before HOME) */
+                            const auto action = resolvePerTitlePolicy(current_tid);
+                            if (action == StartAction::ForcePlay) {
+                                g_user_paused = false;
+                                policyWrite(false);
+                            } else if (action == StartAction::ForcePause) {
+                                policyWrite(true);
+                            } else {
+                                policyWrite(g_saved_pause_state);
+                            }
                         }
                         last_focused = new_focused;
                     }
