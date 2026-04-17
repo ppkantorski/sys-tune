@@ -245,6 +245,103 @@ namespace tune::impl {
         bool g_should_pause      = false;
         bool g_should_run        = true;
 
+        /* --------------------------------------------------------------
+         * pdmqry-based focus detection.
+         *
+         * pmdmnt reports which process is FOREGROUND, but when the user
+         * presses HOME during a game the game process stays foreground
+         * (it's suspended, not closed). So pmdmnt alone cannot tell the
+         * difference between "playing the game" and "at HOME with the
+         * game in the background".
+         *
+         * pdmqry reads the system's play-event log, which records
+         * InFocus/OutOfFocus transitions separately from process
+         * lifecycle. We use it to drive HOME-aware pause/play policy.
+         *
+         * Credit: masagrator (SaltyNX) posted this approach in the
+         * sys-tune GitHub discussion. The cache avoids re-reading the
+         * event log on every 10 ms tick — the event-count check is cheap
+         * (one IPC round-trip, returns counters) and only when the count
+         * increments do we pull the latest 16 events. The event log on
+         * NAND can hold thousands of historical entries; pulling only
+         * the tail keeps this bounded. */
+        bool g_pdmqry_available = false;
+
+        /* Query whether a given application TID is currently out of focus.
+         *
+         * Returns 0 (success) and sets *outOfFocus when TIDnow maps to a
+         * recent AppletId_application event in the play-event log.
+         *
+         * Returns non-zero when TIDnow is NOT a tracked application
+         * (HOME menu, system applet, etc.) or when pdmqry itself failed.
+         * *outOfFocus is left unchanged in that case.
+         *
+         * Cache key is (event_count, TID) so repeated queries for the
+         * same tid are one-IPC-round-trip cheap, but a query for a
+         * different tid correctly re-reads the log. */
+        Result isApplicationOutOfFocus(u64 TIDnow, bool* outOfFocus) {
+            static s32  s_last_total_entries = -1;
+            static u64  s_last_queried_tid   = 0;
+            static bool s_last_is_out        = false;
+            static Result s_last_rc          = 1;
+
+            s32 total_entries = 0, start_entry_index = 0, end_entry_index = 0;
+            Result rc = pdmqryGetAvailablePlayEventRange(
+                &total_entries, &start_entry_index, &end_entry_index);
+            if (R_FAILED(rc)) return rc;
+
+            /* Cache hit. */
+            if (total_entries == s_last_total_entries && TIDnow == s_last_queried_tid) {
+                if (R_SUCCEEDED(s_last_rc))
+                    *outOfFocus = s_last_is_out;
+                return s_last_rc;
+            }
+            s_last_total_entries = total_entries;
+            s_last_queried_tid   = TIDnow;
+
+            /* Pull only the latest 16 events — bounded tail read. */
+            constexpr s32 EVENT_COUNT = 16;
+            PdmPlayEvent events[EVENT_COUNT];
+            s32 out = 0;
+            s32 start = end_entry_index - (EVENT_COUNT - 1);
+            if (start < 0) start = 0;
+
+            rc = pdmqryQueryPlayEvent(start, events, EVENT_COUNT, &out);
+            if (R_FAILED(rc)) { s_last_rc = rc; return rc; }
+            if (out == 0)     { s_last_rc = 1;  return 1;  }
+
+            /* Walk newest -> oldest, find the most recent applet focus
+             * event for TIDnow. Retail games always log under their
+             * base program_id; mask the low 12 bits to match updates/DLC. */
+            int itr = -1;
+            for (int i = out - 1; i >= 0; --i) {
+                const PdmPlayEvent* event = &events[i];
+                if (event->play_event_type != PdmPlayEventType_Applet)
+                    continue;
+                if (event->event_data.applet.applet_id != AppletId_application)
+                    continue;
+
+                union { u32 parts[2]; u64 full; } TID;
+                TID.parts[0] = event->event_data.applet.program_id[1];
+                TID.parts[1] = event->event_data.applet.program_id[0];
+
+                if (TID.full != TIDnow && TID.full != (TIDnow & ~0xFFFULL))
+                    continue;
+
+                itr = i;
+                break;
+            }
+            if (itr == -1) { s_last_rc = 1; return 1; }
+
+            const auto event_type = events[itr].event_data.applet.event_type;
+            const bool isOut = (event_type == PdmAppletEventType_OutOfFocus)
+                            || (event_type == PdmAppletEventType_OutOfFocus4);
+            *outOfFocus   = isOut;
+            s_last_is_out = isOut;
+            s_last_rc     = 0;
+            return 0;
+        }
+
         Result PlayTrack(const char* path) {
             /* Open file and allocate */
             auto source = OpenFile(path);
@@ -337,6 +434,29 @@ namespace tune::impl {
         g_playlist.Init();
 
         /* --------------------------------------------------------------
+         * pdmqry initialization — best effort, degrades gracefully.
+         *
+         * pdm:qry exposes only 3 sessions to user-land and libnx holds
+         * one live. We only need query commands (which don't require an
+         * active session), so clone the handle and close the original
+         * to free a slot.
+         *
+         * If any step fails, g_pdmqry_available stays false and
+         * PmdmntThreadFunc falls back to non-focus-aware behaviour.
+         * -------------------------------------------------------------- */
+        if (R_SUCCEEDED(pdmqryInitialize())) {
+            Service* srv = pdmqryGetServiceSession();
+            Service  clone;
+            if (R_SUCCEEDED(serviceClone(srv, &clone))) {
+                serviceClose(srv);
+                std::memcpy(srv, &clone, sizeof(Service));
+                g_pdmqry_available = true;
+            } else {
+                pdmqryExit();
+            }
+        }
+
+        /* --------------------------------------------------------------
          * Startup-default pause.
          *
          * g_should_pause defaults to false, which means the very first
@@ -355,6 +475,10 @@ namespace tune::impl {
     }
 
     void Exit() {
+        if (g_pdmqry_available) {
+            pdmqryExit();
+            g_pdmqry_available = false;
+        }
         g_should_run = false;
     }
 
@@ -477,56 +601,124 @@ namespace tune::impl {
     }
 
     void PmdmntThreadFunc(void *) {
-        /* Per-title pause/play policy.
+        /* HOME-aware per-title pause/play policy.
          *
-         * Every title has an effective "title_enabled" value:
-         *   true  = play when this title is active
-         *   false = pause when this title is active
+         * Two independent facts at every tick:
+         *   (1) pmdmnt reports which process is foreground  (the "tid")
+         *   (2) pdmqry reports whether that tid is in focus (focused?)
          *
-         * Resolved as: per-title setting if one exists, otherwise the
-         * user's default fallback.
+         * A HOME press leaves the game process foreground but flips it
+         * out of focus. We treat that as a SUSPENSION of the game's
+         * playback state:
          *
-         * On every title transition we apply that value SYMMETRICALLY
-         * — false forces pause, true forces play — so switching between
-         * titles with different settings feels seamless:
+         *   focused -> unfocused  : save g_should_pause, apply HOME's
+         *                           "Pause On Home" policy.
+         *   unfocused -> focused  : restore the saved g_should_pause.
+         *                           (A startup setting shouldn't re-fire
+         *                            every time the user returns from HOME.)
+         *   tid change (focused)  : genuine game switch — apply new
+         *                           title's "Pause On Start" policy.
          *
-         *   Music playing in HOME (pause=off)
-         *      -> enter Game A (pause=on)  -> pauses
-         *      -> back to HOME  (pause=off) -> resumes
-         *      -> enter Game B  (pause=off) -> keeps playing
+         * IMPORTANT: pm::PollCurrentPidTid is EDGE-TRIGGERED — it only
+         * returns true when the foreground PROCESS changes. Pressing
+         * HOME during a game does not change the process (the game is
+         * suspended, not closed), so PollCurrentPidTid stays silent.
+         * We must therefore poll pdmqry EVERY tick, not just on tid
+         * changes, to observe focus flips.
          *
-         * The same policy correctly handles the sysmodule's first poll:
-         * whatever title pmdmnt reports at startup, its setting decides
-         * whether we lift the Initialize()-set startup pause or keep it.
-         * No separate "first poll" branch needed. */
+         * First poll: whatever we observe, apply the title's startup
+         * setting so the Initialize()-set pause is lifted (or not)
+         * correctly. No audio reaches audout until this resolves.
+         *
+         * Per-title VOLUME is orthogonal — always applied on every tid
+         * change, regardless of focus.
+         *
+         * If pdmqry is unavailable we can't detect HOME, so we fall
+         * back to the symmetric non-focus-aware behaviour (apply the
+         * title's setting whenever the tid changes). */
+
+        constexpr u64 kHomeScreenTid = 0x0100000000001000ULL;
+
+        auto resolveTitleEnabled = [](u64 tid) -> bool {
+            return config::has_title_enabled(tid)
+                ? config::get_title_enabled(tid)
+                : config::get_title_enabled_default();
+        };
+
+        bool first_poll        = true;
+        u64  current_tid       = 0;      // tracks the foreground tid across ticks
+        u64  current_pid       = 0;      // tracks foreground pid for volume IPC
+        bool last_focused      = true;   // focus state observed last tick
+        bool saved_pause_state = false;  // g_should_pause snapshot at focus-loss
 
         while (g_should_run) {
-            u64 pid{}, new_tid{};
-            if (pm::PollCurrentPidTid(&pid, &new_tid)) {
-                /* Per-title volume. */
-                g_title_volume = 1.f;
-                if (config::has_title_volume(new_tid)) {
-                    g_use_title_volume = true;
-                    SetTitleVolume(std::clamp(config::get_title_volume(new_tid), 0.f, VOLUME_MAX));
+            /* ---- (1) Tid-change edge: update current_tid + volume ---- */
+            {
+                u64 new_pid{}, new_tid{};
+                if (pm::PollCurrentPidTid(&new_pid, &new_tid)) {
+                    current_pid = new_pid;
+
+                    /* Per-title volume — always applied on tid change. */
+                    g_title_volume = 1.f;
+                    if (config::has_title_volume(new_tid)) {
+                        g_use_title_volume = true;
+                        SetTitleVolume(std::clamp(config::get_title_volume(new_tid), 0.f, VOLUME_MAX));
+                    }
+
+                    if (first_poll) {
+                        /* Boot: apply the startup policy for whatever tid
+                         * we see. Lifts the Initialize()-set pause for
+                         * play-on-start titles. */
+                        g_should_pause = !resolveTitleEnabled(new_tid);
+                        current_tid    = new_tid;
+                        first_poll     = false;
+                        /* last_focused initialised to true above — correct
+                         * initial value for a freshly-launched foreground. */
+                    } else {
+                        /* Genuine title change (different process foreground).
+                         * Apply the new title's Pause On Start policy and
+                         * reset focus tracking for the new tid. */
+                        g_should_pause = !resolveTitleEnabled(new_tid);
+                        current_tid    = new_tid;
+                        last_focused   = true;   // new foreground starts focused
+                    }
                 }
-
-                /* Per-title pause/play — authoritative, symmetric. */
-                const bool title_enabled =
-                    config::has_title_enabled(new_tid)
-                        ? config::get_title_enabled(new_tid)
-                        : config::get_title_enabled_default();
-
-                g_should_pause = !title_enabled;
             }
 
+            /* ---- (2) Level-triggered focus poll (every tick) ---- */
+            if (!first_poll && g_pdmqry_available && current_tid != 0) {
+                bool out = false;
+                const Result rc = isApplicationOutOfFocus(current_tid, &out);
+                if (R_SUCCEEDED(rc)) {
+                    const bool new_focused = !out;
+                    if (new_focused != last_focused) {
+                        if (!new_focused) {
+                            /* Pressed HOME while in a game.
+                             * Snapshot current state and apply HOME's policy. */
+                            saved_pause_state = g_should_pause;
+                            g_should_pause    = !resolveTitleEnabled(kHomeScreenTid);
+                        } else {
+                            /* Returned to the same game from HOME.
+                             * Restore pre-HOME state (don't re-apply
+                             * Pause On Start — that's a startup setting). */
+                            g_should_pause = saved_pause_state;
+                        }
+                        last_focused = new_focused;
+                    }
+                }
+                /* else: current_tid isn't a tracked retail app (HOME
+                 * itself, applet, etc.) — leave focus state untouched. */
+            }
+
+            /* ---- (3) Continuously apply per-title master volume ---- */
             // sadly, we can't simply apply auda when the title changes
             // as it seems to apply to quickly, before the title opens audio
             // services, so the changes don't apply.
             // best option is to repeatdly set the out :/
-            if (pid) {
+            if (current_pid) {
                 const auto v = g_use_title_volume ? g_title_volume : g_default_title_volume;
-                audWrapperSetProcessMasterVolume(pid, 0, v);
-                // audWrapperSetProcessRecordVolume(pid, 0, v);
+                audWrapperSetProcessMasterVolume(current_pid, 0, v);
+                // audWrapperSetProcessRecordVolume(current_pid, 0, v);
             }
 
             svcSleepThread(10'000'000);
