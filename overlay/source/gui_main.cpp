@@ -386,47 +386,74 @@ tsl::elm::Element* SettingsGui::createUI() {
     
 
     // ---- Auto Play ----
-    auto* defaultTitleCategoryHeader = new tsl::elm::CategoryHeader("Title ID");
-    defaultTitleCategoryHeader->setValue(tidLabel(tid), tsl::onTextColor);
-    m_list->addItem(defaultTitleCategoryHeader);
+    // The HOME menu is a peculiar "title":
+    //   - It has no per-game volume to tune, so "Preset Volume" is a no-op.
+    //   - Its tid is a well-known constant rather than meaningful per-game info,
+    //     so the "Title ID" header is noise.
+    //   - The default "Pause On Start" fallback is irrelevant at HOME because
+    //     HOME always has an explicit per-title entry (set via the dedicated
+    //     "Pause On Home" toggle added below).
+    // Hide those three widgets when the current tid is HOME.
+    constexpr u64 kHomeScreenTid = 0x0100000000001000ULL;
+    const bool at_home = (tid == kHomeScreenTid);
 
-    auto default_title_volume_slider = new VolumeTrackBar("\uE13C", false, false, true, "Preset Volume", "%", false);
-    {
-        float per_title_vol = 1.f;
-        tuneGetDefaultTitleVolume(&per_title_vol);
-        if (tid) per_title_vol = config::get_title_volume(tid);
-        default_title_volume_slider->setProgress(static_cast<u8>(std::clamp(per_title_vol * 100.f + 0.5f, 0.f, 100.f)));
-        m_game_default_vol = default_title_volume_slider->getProgress();
-    }
-    default_title_volume_slider->setValueChangedListener([this](u8 value) {
-        m_game_default_vol = value;
-        const float fv = float(value) / 100.f;
-        tuneSetDefaultTitleVolume(fv);
-        if (m_tid) config::set_title_volume(m_tid, fv);
-    });
-    m_game_default_slider = default_title_volume_slider;
-    default_title_volume_slider->setIconTapCallback(makeMuteTap(
-        &m_game_default_slider, &m_game_default_vol, &m_game_default_vol_backup,
-        [this](u8 v) {
-            const float fv = float(v) / 100.f;
+    if (!at_home) {
+        auto* defaultTitleCategoryHeader = new tsl::elm::CategoryHeader("Title ID");
+        defaultTitleCategoryHeader->setValue(tidLabel(tid), tsl::onTextColor);
+        m_list->addItem(defaultTitleCategoryHeader);
+
+        auto default_title_volume_slider = new VolumeTrackBar("\uE13C", false, false, true, "Preset Volume", "%", false);
+        {
+            float per_title_vol = 1.f;
+            tuneGetDefaultTitleVolume(&per_title_vol);
+            if (tid) per_title_vol = config::get_title_volume(tid);
+            default_title_volume_slider->setProgress(static_cast<u8>(std::clamp(per_title_vol * 100.f + 0.5f, 0.f, 100.f)));
+            m_game_default_vol = default_title_volume_slider->getProgress();
+        }
+        default_title_volume_slider->setValueChangedListener([this](u8 value) {
+            m_game_default_vol = value;
+            const float fv = float(value) / 100.f;
             tuneSetDefaultTitleVolume(fv);
             if (m_tid) config::set_title_volume(m_tid, fv);
-        }));
-    m_list->addItem(default_title_volume_slider);
+        });
+        m_game_default_slider = default_title_volume_slider;
+        default_title_volume_slider->setIconTapCallback(makeMuteTap(
+            &m_game_default_slider, &m_game_default_vol, &m_game_default_vol_backup,
+            [this](u8 v) {
+                const float fv = float(v) / 100.f;
+                tuneSetDefaultTitleVolume(fv);
+                if (m_tid) config::set_title_volume(m_tid, fv);
+            }));
+        m_list->addItem(default_title_volume_slider);
 
-    // Default: fallback autoplay state for any game with no per-title entry.
-    // Label shows the current tid for context; value always reflects the true default.
-    auto tune_default_play = new tsl::elm::ToggleListItem("Pause On Start", !config::get_title_enabled_default(), "On", "Off");
-    tune_default_play->setStateChangedListener([tune_default_play, this](bool v) {
-        //tsl::shiftItemFocus(tune_default_play);
-        config::set_title_enabled_default(!v);
-        if (m_tid) config::set_title_enabled(m_tid, !v);
-    });
-    m_default_play_toggle = tune_default_play;
-    m_list->addItem(tune_default_play);
+        // Default: fallback autoplay state for any game with no per-title entry.
+        // Label shows the current tid for context; value always reflects the true default.
+        auto tune_default_play = new tsl::elm::ToggleListItem("Pause On Start", !config::get_title_enabled_default(), "On", "Off");
+        tune_default_play->setStateChangedListener([tune_default_play, this](bool v) {
+            //tsl::shiftItemFocus(tune_default_play);
+            config::set_title_enabled_default(!v);
+            if (m_tid) config::set_title_enabled(m_tid, !v);
+        });
+        m_default_play_toggle = tune_default_play;
+        m_list->addItem(tune_default_play);
+    }
 
     // ---- Misc ----
     m_list->addItem(new tsl::elm::CategoryHeader("Miscellaneous"));
+
+    // Pause On Home — dedicated per-title control for the HOME menu.
+    // Always present regardless of what title is currently running, so the
+    // user can configure HOME-menu behaviour from anywhere. The underlying
+    // storage is the per-title entry for kHomeScreenTid (inverted: toggle
+    // ON = pause = title_enabled FALSE).
+    auto pause_on_home = new tsl::elm::ToggleListItem(
+        "Pause On Home",
+        !config::get_title_enabled(kHomeScreenTid),
+        "On", "Off");
+    pause_on_home->setStateChangedListener([tid_home = kHomeScreenTid](bool v) {
+        config::set_title_enabled(tid_home, !v);
+    });
+    m_list->addItem(pause_on_home);
 
     // Per-title: should music autoplay when THIS specific game launches?
     auto tune_play = new tsl::elm::ToggleListItem("Auto-play Startup", config::get_title_enabled(tid), "On", "Off");
@@ -455,7 +482,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     });
     m_list->addItem(startup_button);
 
-    auto exit_button = new tsl::elm::SilentListItem("Stop sys-tune");
+    auto exit_button = new tsl::elm::ListItem("Stop sys-tune");
     exit_button->setValue("\uE071", true);
     exit_button->setClickListener([exit_button](u64 keys) -> bool {
         if (keys & HidNpadButton_A) {
