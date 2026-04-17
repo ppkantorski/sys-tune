@@ -240,7 +240,7 @@ namespace tune::impl {
 
         /* Title-transition fade parameters.
          * 50 steps × 20 ms = 1 000 ms total ramp time. */
-        constexpr int  kFadeSteps           = 100;
+        constexpr int  kFadeSteps           = 200;
         constexpr u64  kFadeStepIntervalNs  = 5'000'000ULL;
 
         AudioOutBuffer g_audout_buffer[AUDIO_BUFFER_COUNT];
@@ -402,7 +402,7 @@ namespace tune::impl {
 
             while (g_should_run && g_status == PlayerStatus::Playing) {
                 if (g_should_pause) {
-                    svcSleepThread(17'000'000);
+                    svcSleepThread(50'000'000);
                     continue;
                 }
 
@@ -499,16 +499,16 @@ namespace tune::impl {
         /* --------------------------------------------------------------
          * Startup-default pause.
          *
-         * g_should_pause defaults to false, which means the very first
-         * iteration of PlayTrack()'s decode loop will append a (small)
-         * audio buffer to audout BEFORE PmdmntThreadFunc has had a chance
-         * to consult the per-title "Auto-play Startup" config — producing
-         * an audible blip whenever autoplay is meant to be off.
-         *
-         * Force-pause here. PmdmntThreadFunc's first poll will lift this
-         * pause within ~10 ms iff the running title is allowed to play.
+         * Set g_should_pause directly from the Auto-play Startup config
+         * before any thread starts.  This guarantees the correct initial
+         * state regardless of whether PmdmntThreadFunc's PollCurrentPidTid
+         * edge ever fires (it won't if no foreground process change occurs
+         * after the sysmodule spawns — e.g. the user stays on HOME the
+         * whole time).  config:: reads are safe here because sdmc is open
+         * before Initialize() is called (evidenced by get_volume() working
+         * in the same function).
          * -------------------------------------------------------------- */
-        g_should_pause = true;
+        g_should_pause = !config::get_auto_play_startup();
 
         return 0;
 
@@ -619,8 +619,13 @@ namespace tune::impl {
 
         bool pre_unplug_pause = false;
 
-        /* [0] Low == plugged in; [1] High == not plugged in. */
+        /* Read the actual headphone-jack state before entering the loop.
+         * Without this, old_value defaults to High ("unplugged"), so if
+         * headphones are already plugged in at sysmodule start the first
+         * gpioPadGetValue() call sees a High→Low transition and forces
+         * g_should_pause = false, defeating Auto-play Startup OFF. */
         GpioValue old_value = GpioValue_High;
+        gpioPadGetValue(session, &old_value);
 
         // TODO(TJ): pausing on headphone change should be a config option.
         while (g_should_run) {
@@ -700,8 +705,22 @@ namespace tune::impl {
         enum class StartAction { DoNothing, ForcePlay, ForcePause };
 
         auto resolvePerTitlePolicy = [](u64 tid) -> StartAction {
-            /* Pause On Start takes priority if somehow both keys are set
-             * (mutual exclusion is enforced by the UI, but be defensive). */
+            /* The HOME screen tid always uses its own per-title entry
+             * (the dedicated "Pause On Home" toggle).  Never apply the
+             * global Play/Pause On Title defaults to it. */
+            constexpr u64 kHomeScreenTidLocal = 0x0100000000001000ULL;
+
+            if (tid != kHomeScreenTidLocal && config::get_default_on_start(tid)) {
+                /* This title defers to the global defaults. */
+                if (config::get_pause_on_title())
+                    return StartAction::ForcePause;
+                if (config::get_play_on_title())
+                    return StartAction::ForcePlay;
+                return StartAction::DoNothing;
+            }
+
+            /* Per-title override path (Default On Start is OFF,
+             * or this is the HOME screen tid). */
             if (config::has_title_pause_on_start(tid) &&
                 config::get_title_pause_on_start(tid))
                 return StartAction::ForcePause;
@@ -717,6 +736,38 @@ namespace tune::impl {
             if (!should_pause && g_user_paused)
                 return;  // veto: user's Pause outranks this unpause
             g_should_pause = should_pause;
+        };
+
+        /* Shared fade helpers — used by both the title-change path and the
+         * HOME focus-flip path so the behaviour is identical in all cases. */
+        auto fadeOut = [&](int steps = kFadeSteps, u64 interval_ns = kFadeStepIntervalNs) {
+            if (g_should_pause) {
+                policyWrite(true);
+                return;
+            }
+            float vol = GetVolume();
+            for (int i = steps - 1; i >= 0 && g_should_run; --i) {
+                audoutSetAudioOutVolume(vol * (static_cast<float>(i) / steps));
+                svcSleepThread(interval_ns);
+            }
+            policyWrite(true);
+            svcSleepThread(3ULL * AUDIO_LATENCY_MS * 1'000'000ULL);
+            audoutSetAudioOutVolume(vol); // restore after drain
+        };
+
+        auto fadeIn = [&](int steps = kFadeSteps, u64 interval_ns = kFadeStepIntervalNs) {
+            if (!g_should_pause) {
+                policyWrite(false);
+                return;
+            }
+            float target = GetVolume();
+            audoutSetAudioOutVolume(0.f);
+            policyWrite(false);
+            for (int i = 1; i <= steps && g_should_run; ++i) {
+                audoutSetAudioOutVolume(target * (static_cast<float>(i) / steps));
+                svcSleepThread(interval_ns);
+            }
+            audoutSetAudioOutVolume(target);
         };
 
         bool first_poll   = true;
@@ -741,14 +792,44 @@ namespace tune::impl {
                     }
 
                     if (first_poll) {
-                        /* Boot: use the global Auto-play Startup toggle.
-                         * Per-title Play/Pause On Start are intentionally
-                         * ignored at boot — the sysmodule may be spawned
-                         * from any title or HOME, and the user's intent is
-                         * captured by the single "should music play when
-                         * the module starts?" question. */
-                        policyWrite(!config::get_auto_play_startup());
+                        /* Boot: g_should_pause was already committed in
+                         * Initialize() from get_auto_play_startup().
+                         * Do NOT call policyWrite() here — that would race
+                         * with Initialize() and unnecessarily re-reads
+                         * the config.  Just record the initial tid so the
+                         * else-branch fires on the next genuine title
+                         * change.  Per-title Play/Pause On Start are
+                         * intentionally skipped at boot. */
                         current_tid = new_tid;
+
+                        /* Seed last_focused from the actual observed focus
+                         * state, NOT the hard-coded `true` default.  Without
+                         * this, starting the sysmodule while the user is on
+                         * HOME with a game suspended in the background (game
+                         * is OOF) makes the very next focus-detection tick
+                         * see a fake `true → false` transition and fire the
+                         * HOME-press handler — which then applies HOME's
+                         * policy (e.g. `fadeIn()` if "Play On Home" was ever
+                         * toggled on, or `fadeOut()` if "Pause On Home" is
+                         * on) and silently overrides the Auto-play Startup
+                         * setting Initialize() just committed.
+                         *
+                         * The user never pressed HOME — they were already on
+                         * HOME when the sysmodule spawned.  Seeding from the
+                         * real state means the first focus tick sees
+                         * `new_focused == last_focused` and no handler fires,
+                         * so Auto-play Startup is preserved.  For
+                         * kHomeScreenTid and non-application tids,
+                         * isApplicationOutOfFocus returns non-zero and we
+                         * leave last_focused at its default — focus detection
+                         * skips those tids anyway, so it doesn't matter. */
+                        if (g_pdmqry_available && new_tid != kHomeScreenTid && new_tid != 0) {
+                            bool initial_out = false;
+                            if (R_SUCCEEDED(isApplicationOutOfFocus(new_tid, &initial_out))) {
+                                last_focused = !initial_out;
+                            }
+                        }
+
                         first_poll  = false;
                     } else {
                         /* Genuine title change.
@@ -769,67 +850,9 @@ namespace tune::impl {
                                  * play — that IS their stated intent, so it
                                  * overrides any prior manual pause veto. */
                                 g_user_paused = false;
-
-                                if (g_should_pause) {
-                                    /* Music was paused before this title launched.
-                                     * Fade in over 1 s so playback doesn't abruptly
-                                     * interrupt the game's own audio ramp-up.
-                                     *
-                                     * Steps:
-                                     *  1. Snapshot the user's configured volume.
-                                     *  2. Drop audout to silence (before unpausing
-                                     *     so the decode loop never emits full-volume
-                                     *     samples on its first iteration).
-                                     *  3. Unpause — the decode loop starts filling
-                                     *     buffers immediately but at volume 0.
-                                     *  4. Ramp up to the configured volume over
-                                     *     kFadeSteps × kFadeStepIntervalNs. */
-                                    float target = GetVolume();
-                                    audoutSetAudioOutVolume(0.f);
-                                    policyWrite(false);
-                                    for (int i = 1; i <= kFadeSteps && g_should_run; ++i) {
-                                        audoutSetAudioOutVolume(
-                                            target * (static_cast<float>(i) / kFadeSteps));
-                                        svcSleepThread(kFadeStepIntervalNs);
-                                    }
-                                    /* Guarantee the exact configured level at the end
-                                     * (avoids any floating-point rounding residual). */
-                                    audoutSetAudioOutVolume(target);
-                                } else {
-                                    /* Music was already playing — no fade needed;
-                                     * the listener already hears it at full volume. */
-                                    policyWrite(false);
-                                }
+                                fadeIn();
                             } else if (action == StartAction::ForcePause) {
-                                if (!g_should_pause) {
-                                    /* Music was playing before this title launched.
-                                     * Fade out over 1 s, then pause.
-                                     *
-                                     * Steps:
-                                     *  1. Snapshot the user's configured volume.
-                                     *  2. Ramp down to silence over kFadeSteps.
-                                     *  3. Pause — the decode loop stops consuming
-                                     *     buffers.
-                                     *  4. Restore the configured volume so the next
-                                     *     unpause (e.g. Play button) comes back at
-                                     *     the right level, not silence. */
-                                    float vol = GetVolume();
-                                    for (int i = kFadeSteps - 1; i >= 0 && g_should_run; --i) {
-                                        audoutSetAudioOutVolume(
-                                            vol * (static_cast<float>(i) / kFadeSteps));
-                                        svcSleepThread(kFadeStepIntervalNs);
-                                    }
-                                    /* Keep at 0 while issuing the pause so the
-                                     * decode loop stops at silence, then restore
-                                     * the configured level so the next unpause
-                                     * (e.g. Play button) comes back at full
-                                     * volume rather than staying muted. */
-                                    policyWrite(true);
-                                    audoutSetAudioOutVolume(vol); // restore after pause
-                                } else {
-                                    /* Already paused — nothing to fade. */
-                                    policyWrite(true);
-                                }
+                                fadeOut();
                             }
                             /* DoNothing: leave g_should_pause as-is. */
                         }
@@ -855,31 +878,44 @@ namespace tune::impl {
                             g_saved_pause_state = g_should_pause;
                             const auto action = resolvePerTitlePolicy(kHomeScreenTid);
                             if (action == StartAction::ForcePause)
-                                policyWrite(true);
-                            else if (action == StartAction::ForcePlay)
-                                policyWrite(false);
+                                fadeOut(kFadeSteps / 2);
+                            else if (action == StartAction::ForcePlay) {
+                                /* Home Focus = Play should override a manual
+                                 * pause veto, just as Title/Custom Focus = Play
+                                 * does on title launch and HOME return. */
+                                g_user_paused = false;
+                                fadeIn(kFadeSteps / 2);
+                            }
                             /* DoNothing: leave playback state unchanged. */
                         } else {
                             /* Returned to the same game from HOME.
                              *
-                             * Re-apply Play On Start / Pause On Start so that
-                             * coming back from HOME behaves the same as
-                             * entering the title fresh:
+                             * Treated identically to a fresh title launch:
                              *
-                             *   ForcePlay  → start playing (clears user-pause
-                             *                veto just like a title launch)
-                             *   ForcePause → pause
+                             *   ForcePlay  → always play (clears manual-pause
+                             *                veto, mirrors first-launch behaviour).
+                             *   ForcePause → always pause (safe direction).
                              *   DoNothing  → restore the state captured at
-                             *                focus-loss (continue whatever
-                             *                was happening before HOME) */
+                             *                focus-loss. */
                             const auto action = resolvePerTitlePolicy(current_tid);
                             if (action == StartAction::ForcePlay) {
+                                /* ForcePlay on HOME return behaves the same as
+                                 * ForcePlay on first title launch: the user has
+                                 * explicitly configured this title to play, so
+                                 * that intent overrides any prior manual pause
+                                 * or startup-pause state.  Clear the user-pause
+                                 * veto so policyWrite() inside fadeIn() can
+                                 * take effect. */
                                 g_user_paused = false;
-                                policyWrite(false);
+                                fadeIn(kFadeSteps / 2);
                             } else if (action == StartAction::ForcePause) {
-                                policyWrite(true);
+                                fadeOut(kFadeSteps / 2);
                             } else {
-                                policyWrite(g_saved_pause_state);
+                                // Restore snapshotted state; fade in if resuming play.
+                                if (!g_saved_pause_state && g_should_pause)
+                                    fadeIn(kFadeSteps / 2);
+                                else
+                                    policyWrite(g_saved_pause_state);
                             }
                         }
                         last_focused = new_focused;
@@ -890,14 +926,32 @@ namespace tune::impl {
             }
 
             /* ---- (3) Continuously apply per-title master volume ---- */
-            // sadly, we can't simply apply auda when the title changes
-            // as it seems to apply to quickly, before the title opens audio
-            // services, so the changes don't apply.
-            // best option is to repeatdly set the out :/
+            // The volume cannot be applied just once at title change because
+            // the game may not have opened its audio services yet. Instead we
+            // apply it on every tick for a short settling window after each
+            // pid change (~300 ms = 30 ticks x 10 ms), which covers even
+            // slow-launching games. After that we only re-apply when the
+            // value itself changes, eliminating the steady-state IPC cost.
             if (current_pid) {
                 const auto v = g_use_title_volume ? g_title_volume : g_default_title_volume;
-                audWrapperSetProcessMasterVolume(current_pid, 0, v);
-                // audWrapperSetProcessRecordVolume(current_pid, 0, v);
+                static u64   s_last_vol_pid = 0;
+                static float s_last_vol     = -1.f;
+                static int   s_settle_ticks = 0;
+
+                if (current_pid != s_last_vol_pid) {
+                    // New title: reset settle counter and force first application.
+                    s_last_vol_pid = current_pid;
+                    s_last_vol     = -1.f;  // force re-apply
+                    s_settle_ticks = 30;    // 30 x 10 ms = 300 ms settling window
+                }
+
+                if (s_settle_ticks > 0 || v != s_last_vol) {
+                    audWrapperSetProcessMasterVolume(current_pid, 0, v);
+                    // audWrapperSetProcessRecordVolume(current_pid, 0, v);
+                    s_last_vol = v;
+                    if (s_settle_ticks > 0)
+                        --s_settle_ticks;
+                }
             }
 
             svcSleepThread(10'000'000);
@@ -1102,7 +1156,7 @@ namespace tune::impl {
             g_queue_position = std::min(index, size - 1);
         }
         g_status             = PlayerStatus::FetchNext;
-        g_should_pause       = false;
+        g_should_pause        = false;
         g_user_paused        = false;
         g_saved_pause_state  = false;
     }
