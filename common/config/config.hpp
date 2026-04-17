@@ -43,6 +43,22 @@ void set_title_enabled_default(bool value);
 auto get_auto_play_startup() -> bool;
 void set_auto_play_startup(bool value);
 
+// Global title-transition defaults — applied to any title whose
+// per-title "Default On Start" flag is ON (the factory default).
+// Mutually exclusive by convention (UI enforces it).
+//   Play On Title  -> music plays  when any title launches
+//   Pause On Title -> music pauses when any title launches
+auto get_play_on_title() -> bool;
+void set_play_on_title(bool value);
+auto get_pause_on_title() -> bool;
+void set_pause_on_title(bool value);
+
+// Per-title opt-in to the global defaults above.
+// Defaults to true — a fresh title uses Play/Pause On Title until the
+// user explicitly turns this OFF and configures per-title overrides.
+auto get_default_on_start(u64 tid) -> bool;
+void set_default_on_start(u64 tid, bool value);
+
 // per title volume
 auto has_title_volume(u64 tid) -> bool;
 auto get_title_volume(u64 tid) -> float;
