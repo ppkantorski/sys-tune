@@ -336,6 +336,20 @@ namespace tune::impl {
         // reserves memory so that we don't allocate later on.
         g_playlist.Init();
 
+        /* --------------------------------------------------------------
+         * Startup-default pause.
+         *
+         * g_should_pause defaults to false, which means the very first
+         * iteration of PlayTrack()'s decode loop will append a (small)
+         * audio buffer to audout BEFORE PmdmntThreadFunc has had a chance
+         * to consult the per-title "Auto-play Startup" config — producing
+         * an audible blip whenever autoplay is meant to be off.
+         *
+         * Force-pause here. PmdmntThreadFunc::first_poll will lift this
+         * pause within ~10 ms iff the running title is allowed to play.
+         * -------------------------------------------------------------- */
+        g_should_pause = true;
+
         return 0;
 
     }
@@ -463,6 +477,16 @@ namespace tune::impl {
     }
 
     void PmdmntThreadFunc(void *) {
+        /* The very first successful poll is allowed to LIFT the startup-
+         * default pause set by Initialize() — but only if the running
+         * title's autoplay setting (or the default fallback) says to play.
+         *
+         * On subsequent polls we keep the original behaviour: only ever
+         * force-pause, never force-play, so user actions (Play/Pause from
+         * the overlay, headphone replug, etc.) are respected across
+         * title transitions. */
+        bool first_poll = true;
+
         while (g_should_run) {
             u64 pid{}, new_tid{};
             if (pm::PollCurrentPidTid(&pid, &new_tid)) {
@@ -473,17 +497,24 @@ namespace tune::impl {
                     SetTitleVolume(std::clamp(config::get_title_volume(new_tid), 0.f, VOLUME_MAX));
                 }
 
-                if (config::has_title_enabled(new_tid)) {
-                    // Only pause if the per-title config says to pause.
-                    // Never force-play — respect whatever state the player is already in.
-                    if (!config::get_title_enabled(new_tid)) {
-                        g_should_pause = true;
-                    }
-                } else {
-                    if (!config::get_title_enabled_default()) {
-                        g_should_pause = true;
-                    }
+                /* Resolve the effective autoplay decision for this title:
+                 *   per-title setting if it exists, otherwise the default. */
+                const bool title_enabled =
+                    config::has_title_enabled(new_tid)
+                        ? config::get_title_enabled(new_tid)
+                        : config::get_title_enabled_default();
+
+                if (!title_enabled) {
+                    g_should_pause = true;
+                } else if (first_poll) {
+                    /* First poll only: clear the startup-default pause so
+                     * autoplay-enabled titles begin playing as expected. */
+                    g_should_pause = false;
                 }
+                /* Subsequent polls with title_enabled == true: do nothing,
+                 * preserving the user's current play/pause state. */
+
+                first_poll = false;
             }
 
             // sadly, we can't simply apply auda when the title changes
