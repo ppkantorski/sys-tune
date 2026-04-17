@@ -97,10 +97,6 @@ private:
     // Title ID needed by handleInput to call config::set_title_volume().
     u64 m_tid = 0;
 
-    // Pointer to the "Tune (default)" toggle so update() can refresh its
-    // label and state when the running title changes.  Owned by m_list.
-    tsl::elm::ToggleListItem *m_default_play_toggle = nullptr;
-
     // Last tid we built the title-id labels for — lets update() detect changes.
     u64 m_last_tid = UINT64_MAX; /* sentinel — forces first refresh */
 };

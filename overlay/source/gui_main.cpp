@@ -426,42 +426,88 @@ tsl::elm::Element* SettingsGui::createUI() {
             }));
         m_list->addItem(default_title_volume_slider);
 
-        // Default: fallback autoplay state for any game with no per-title entry.
-        // Label shows the current tid for context; value always reflects the true default.
-        auto tune_default_play = new tsl::elm::ToggleListItem("Pause On Start", !config::get_title_enabled_default(), "On", "Off");
-        tune_default_play->setStateChangedListener([tune_default_play, this](bool v) {
-            //tsl::shiftItemFocus(tune_default_play);
-            config::set_title_enabled_default(!v);
-            if (m_tid) config::set_title_enabled(m_tid, !v);
+        // ---- Per-title start-up policy (tri-state: Play / Pause / Neither) ----
+        //
+        // Play On Start and Pause On Start are mutually exclusive:
+        // turning one ON forces the other OFF. If both are OFF, the
+        // policy engine takes no action at title transition — music
+        // simply keeps doing whatever it was doing before the switch.
+        //
+        // Storage:
+        //   Play On Start  -> config::title_enabled(tid) = true
+        //   Pause On Start -> config::title_pause_on_start(tid) = true
+        //   Neither        -> both keys absent/false
+        //
+        // Forward declare pointers so each listener can toggle the other.
+        tsl::elm::ToggleListItem *play_on_start  = nullptr;
+        tsl::elm::ToggleListItem *pause_on_start = nullptr;
+
+        const bool init_play  = config::has_title_enabled(tid) && config::get_title_enabled(tid);
+        const bool init_pause = config::has_title_pause_on_start(tid) && config::get_title_pause_on_start(tid);
+
+        play_on_start = new tsl::elm::ToggleListItem("Play On Start", init_play, "On", "Off");
+        pause_on_start = new tsl::elm::ToggleListItem("Pause On Start", init_pause, "On", "Off");
+
+        play_on_start->setStateChangedListener([pause_on_start, tid](bool v) {
+            if (v) {
+                /* Turning Play On Start ON — persist and force the
+                 * opposite toggle OFF. */
+                config::set_title_enabled(tid, true);
+                config::clear_title_pause_on_start(tid);
+                if (pause_on_start) pause_on_start->setState(false);
+            } else {
+                /* Turning Play On Start OFF — clear the key entirely
+                 * rather than writing false, so the tri-state resolver
+                 * sees "no action configured". */
+                config::clear_title_enabled(tid);
+            }
         });
-        m_default_play_toggle = tune_default_play;
-        m_list->addItem(tune_default_play);
+
+        pause_on_start->setStateChangedListener([play_on_start, tid](bool v) {
+            if (v) {
+                config::set_title_pause_on_start(tid, true);
+                config::clear_title_enabled(tid);
+                if (play_on_start) play_on_start->setState(false);
+            } else {
+                config::clear_title_pause_on_start(tid);
+            }
+        });
+
+        m_list->addItem(play_on_start);
+        m_list->addItem(pause_on_start);
     }
 
     // ---- Misc ----
     m_list->addItem(new tsl::elm::CategoryHeader("Miscellaneous"));
 
     // Pause On Home — dedicated per-title control for the HOME menu.
-    // Always present regardless of what title is currently running, so the
-    // user can configure HOME-menu behaviour from anywhere. The underlying
-    // storage is the per-title entry for kHomeScreenTid (inverted: toggle
-    // ON = pause = title_enabled FALSE).
+    // Always visible regardless of what title is running. Uses the
+    // dedicated "title_pause_on_start" storage for consistency with
+    // the per-title Pause On Start semantics above.
     auto pause_on_home = new tsl::elm::ToggleListItem(
         "Pause On Home",
-        !config::get_title_enabled(kHomeScreenTid),
+        config::has_title_pause_on_start(kHomeScreenTid) && config::get_title_pause_on_start(kHomeScreenTid),
         "On", "Off");
     pause_on_home->setStateChangedListener([tid_home = kHomeScreenTid](bool v) {
-        config::set_title_enabled(tid_home, !v);
+        if (v)
+            config::set_title_pause_on_start(tid_home, true);
+        else
+            config::clear_title_pause_on_start(tid_home);
     });
     m_list->addItem(pause_on_home);
 
-    // Per-title: should music autoplay when THIS specific game launches?
-    auto tune_play = new tsl::elm::ToggleListItem("Auto-play Startup", config::get_title_enabled(tid), "On", "Off");
-    tune_play->setStateChangedListener([tune_play, tid](bool v) {
-        //tsl::shiftItemFocus(tune_play);
-        config::set_title_enabled(tid, v);
+    // Auto-play Startup — applies to the sysmodule itself, not any
+    // individual title. When ON, music begins playing as soon as the
+    // sysmodule starts up (assuming a startup playlist is set),
+    // regardless of which title is in foreground at boot time.
+    auto auto_play_startup = new tsl::elm::ToggleListItem(
+        "Auto-play Startup",
+        config::get_auto_play_startup(),
+        "On", "Off");
+    auto_play_startup->setStateChangedListener([](bool v) {
+        config::set_auto_play_startup(v);
     });
-    m_list->addItem(tune_play);
+    m_list->addItem(auto_play_startup);
 
     auto startup_button = new tsl::elm::ListItem("Remove Startup");
     startup_button->setClickListener([this, startup_button](u64 keys) -> bool {
@@ -539,13 +585,6 @@ void SettingsGui::update() {
                 const u8 pct = static_cast<u8>(std::clamp(vol * 100.f + 0.5f, 0.f, 100.f));
                 m_game_default_slider->setProgress(pct);
                 m_game_default_vol = pct;
-            }
-
-            // Refresh the default autoplay toggle — relabel with new tid, but
-            // the value always reflects the true default, not the per-title setting.
-            if (m_default_play_toggle) {
-                m_default_play_toggle->setText(label);
-                m_default_play_toggle->setState(!config::get_title_enabled_default());
             }
         }
     }
