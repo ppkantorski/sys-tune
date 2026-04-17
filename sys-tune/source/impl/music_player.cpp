@@ -345,7 +345,7 @@ namespace tune::impl {
          * to consult the per-title "Auto-play Startup" config — producing
          * an audible blip whenever autoplay is meant to be off.
          *
-         * Force-pause here. PmdmntThreadFunc::first_poll will lift this
+         * Force-pause here. PmdmntThreadFunc's first poll will lift this
          * pause within ~10 ms iff the running title is allowed to play.
          * -------------------------------------------------------------- */
         g_should_pause = true;
@@ -477,44 +477,46 @@ namespace tune::impl {
     }
 
     void PmdmntThreadFunc(void *) {
-        /* The very first successful poll is allowed to LIFT the startup-
-         * default pause set by Initialize() — but only if the running
-         * title's autoplay setting (or the default fallback) says to play.
+        /* Per-title pause/play policy.
          *
-         * On subsequent polls we keep the original behaviour: only ever
-         * force-pause, never force-play, so user actions (Play/Pause from
-         * the overlay, headphone replug, etc.) are respected across
-         * title transitions. */
-        bool first_poll = true;
+         * Every title has an effective "title_enabled" value:
+         *   true  = play when this title is active
+         *   false = pause when this title is active
+         *
+         * Resolved as: per-title setting if one exists, otherwise the
+         * user's default fallback.
+         *
+         * On every title transition we apply that value SYMMETRICALLY
+         * — false forces pause, true forces play — so switching between
+         * titles with different settings feels seamless:
+         *
+         *   Music playing in HOME (pause=off)
+         *      -> enter Game A (pause=on)  -> pauses
+         *      -> back to HOME  (pause=off) -> resumes
+         *      -> enter Game B  (pause=off) -> keeps playing
+         *
+         * The same policy correctly handles the sysmodule's first poll:
+         * whatever title pmdmnt reports at startup, its setting decides
+         * whether we lift the Initialize()-set startup pause or keep it.
+         * No separate "first poll" branch needed. */
 
         while (g_should_run) {
             u64 pid{}, new_tid{};
             if (pm::PollCurrentPidTid(&pid, &new_tid)) {
+                /* Per-title volume. */
                 g_title_volume = 1.f;
-
                 if (config::has_title_volume(new_tid)) {
                     g_use_title_volume = true;
                     SetTitleVolume(std::clamp(config::get_title_volume(new_tid), 0.f, VOLUME_MAX));
                 }
 
-                /* Resolve the effective autoplay decision for this title:
-                 *   per-title setting if it exists, otherwise the default. */
+                /* Per-title pause/play — authoritative, symmetric. */
                 const bool title_enabled =
                     config::has_title_enabled(new_tid)
                         ? config::get_title_enabled(new_tid)
                         : config::get_title_enabled_default();
 
-                if (!title_enabled) {
-                    g_should_pause = true;
-                } else if (first_poll) {
-                    /* First poll only: clear the startup-default pause so
-                     * autoplay-enabled titles begin playing as expected. */
-                    g_should_pause = false;
-                }
-                /* Subsequent polls with title_enabled == true: do nothing,
-                 * preserving the user's current play/pause state. */
-
-                first_poll = false;
+                g_should_pause = !title_enabled;
             }
 
             // sadly, we can't simply apply auda when the title changes
