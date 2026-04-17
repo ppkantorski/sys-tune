@@ -325,7 +325,7 @@ PlaylistGui::PlaylistGui(std::function<void(u32)> on_count_changed)
                             static_cast<u32>(k + 1));
 
                     notifyCountChanged(m_on_count_changed);
-                    triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
+                    triggerMoveFeedback();
                 }
                 return true;
 
@@ -350,7 +350,7 @@ PlaylistGui::PlaylistGui(std::function<void(u32)> on_count_changed)
                         r->drawString("Playlist is empty!", false, tx, y + (h / 2) + 90+30, 25, tsl::defaultTextColor);
                     }), 380);
                     if (m_on_count_changed) {
-                        triggerFeedbackImpl(triggerRumbleClick, triggerMoveSound);
+                        triggerMoveFeedback();
                         m_on_count_changed(0);
                     }
                 }
@@ -418,8 +418,8 @@ bool PlaylistGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &t
                      || ((keysDown & KEY_LEFT) && !(keysHeld & ~KEY_LEFT & ~KEY_R & ALL_KEYS_MASK));
     if (goLeft) {
         setPlayerRightDest(PlayerRightDest::Playlist);
-        triggerNavigationFeedback();
         tsl::swapTo<MainGui>(SwapDepth{2});
+        triggerNavigationFeedback();
         return true;
     }
     return SysTuneGui::handleInput(keysDown, keysHeld, touchPos,

@@ -20,7 +20,7 @@ tsl::elm::Element *ErrorGui::createUI() {
 
     auto custom = new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *drawer, u16 x, u16 y, u16 w, u16 h) {
         drawer->drawString("\uE150", false, x + (w / 2) - (90 / 2), 300, 90, 0xffff);
-        auto [width, height] = drawer->drawString(this->m_msg, false, x + (w / 2) - (this->msgW / 2), 380, 25, 0xffff);
+        const auto [width, height] = drawer->drawString(this->m_msg, false, x + (w / 2) - (this->msgW / 2), 380, 25, 0xffff);
         if (msgW == 0) {
             msgW = width;
             msgH = height;

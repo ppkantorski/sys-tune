@@ -280,7 +280,7 @@ void init() {
     // Detect expanded memory early so wallpaper and other memory-dependent
     // features are correctly gated from the very first overlay frame.
     ult::currentHeapSize = ult::getCurrentHeapSize();
-    ult::expandedMemory  = ult::currentHeapSize >= ult::OverlayHeapSize::Size_8MB;
+    ult::expandedMemory  = ult::currentHeapSize >= ult::OverlayHeapSize::Size_6MB;
 
     readState();
 

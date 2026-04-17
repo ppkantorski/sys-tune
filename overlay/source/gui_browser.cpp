@@ -331,8 +331,8 @@ bool BrowserGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &to
     if (goLeft) {
         setBrowserReturnPath(m_cwd, m_root);
         setPlayerRightDest(PlayerRightDest::Browse);
-        triggerNavigationFeedback();
         tsl::swapTo<MainGui>(SwapDepth{2});
+        triggerNavigationFeedback();
         return true;
     }
 
@@ -346,8 +346,8 @@ bool BrowserGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &to
         /* Inside a subdir: swap this BrowserGui with one at the parent directory.
            focus_name = current dir name so the cursor lands on the right item.
            Stack stays constant: [SettingsGui, BrowserGui]. */
-        triggerExitFeedback();
         tsl::swapTo<BrowserGui>(parentPath(), currentDirName(), m_root, m_on_count_changed);
+        triggerExitFeedback();
         return true;
     }
 

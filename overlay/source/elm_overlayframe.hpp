@@ -34,8 +34,11 @@ public:
 
     // -----------------------------------------------------------------------
     void draw(tsl::gfx::Renderer *renderer) override {
-        renderer->fillScreen(a(tsl::defaultBackgroundColor));
-        renderer->drawWallpaper();
+        if (ult::expandedMemory && !ult::refreshWallpaper.load(std::memory_order_acquire) &&
+            !ult::wallpaperData.empty() && ult::correctFrameSize)
+            renderer->drawWallpaper();
+        else
+            renderer->fillScreen(a(tsl::defaultBackgroundColor));
 
 #if USING_WIDGET_DIRECTIVE
         renderer->drawWidget();
@@ -123,7 +126,7 @@ public:
         renderer->drawStringWithColoredSections(currentBottomLine, false, tsl::s_footerSpecialChars,
             buttonStartX, 693, 23, tsl::bottomTextColor, tsl::buttonColor);
 
-        if (!usingUnfocusedColor) {
+        if (!selectIsUsingFocusedColor) {
             static const std::string okOverdraw = "\uE0E0" + ult::GAP_2 + ult::OK + ult::GAP_1;
             renderer->drawStringWithColoredSections(okOverdraw, false, tsl::s_footerSpecialChars,
                 buttonStartX + _backWidth, 693, 23, tsl::unfocusedColor, tsl::unfocusedColor);

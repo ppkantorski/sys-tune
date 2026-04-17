@@ -1,4 +1,6 @@
 #define TESLA_INIT_IMPL
+
+#include "exception_wrap.hpp"
 #include "tune.h"
 #include "gui_error.hpp"
 #include "gui_main.hpp"
@@ -57,8 +59,36 @@ class SysTuneOverlay final : public tsl::Overlay {
                             "launch sysmodule";
                 return;
             }
-            svcSleepThread(500'000'000ULL);
-            rc = tuneInitialize();
+
+            /* The sysmodule has been launched, but its IPC port isn't
+             * registered yet. Poll tuneInitialize() in short intervals
+             * until either it succeeds, the budget is exhausted, or a
+             * non-recoverable error code comes back.
+             *
+             * Budget : 300 ms total
+             * Poll   : 10 ms (up to 30 attempts)
+             *
+             * On a fast/idle system this typically returns on the 1st
+             * or 2nd retry (~10-20 ms). On a busy system the budget
+             * gives the service ample time to publish before we fall
+             * through to the "Something went wrong" path with the
+             * last rc still in hand. */
+            constexpr u64 kPollIntervalNs = 10'000'000ULL;   // 10 ms
+            constexpr int kMaxAttempts    = 30;              // 300 ms total
+
+            for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+                svcSleepThread(kPollIntervalNs);
+                rc = tuneInitialize();
+                if (R_SUCCEEDED(rc))
+                    break;
+
+                /* Only NotFound / ConnectionRefused mean "service not
+                 * ready yet" — anything else is a real failure and
+                 * additional polling won't change the outcome. */
+                if (R_VALUE(rc) != KERNELRESULT(NotFound) &&
+                    R_VALUE(rc) != KERNELRESULT(ConnectionRefused))
+                    break;
+            }
         }
 
         if (R_FAILED(rc)) {

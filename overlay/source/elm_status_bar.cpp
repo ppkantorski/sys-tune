@@ -366,6 +366,230 @@ namespace {
         }
     }
 
+    // =========================================================================
+    // Streaming JPEG decode — no iw×ih×3 output buffer
+    // =========================================================================
+    //
+    // stb_image's load_jpeg_image() allocates iw×ih×n bytes for the full RGB
+    // output before scaling.  The YCbCr→RGB loop inside it already processes
+    // one row at a time, so we can replace the big allocation with a single
+    // row buffer and call a user callback after each row.
+    //
+    // NOTE: stbi__decode_jpeg_image() still allocates the YCbCr component
+    // rasters (≈ iw×ih×1.5 for 4:2:0), which is unavoidable without rewriting
+    // the JPEG MCU decoder.  But eliminating the RGB output buffer saves
+    // iw×ih×3 bytes — a 3× reduction in peak heap pressure for large art.
+    //
+    // Because STB_IMAGE_IMPLEMENTATION is defined in this TU, all internal
+    // stb_image types (stbi__jpeg, stbi__resample, …) and static helpers
+    // (stbi__decode_jpeg_image, resample_row_1, …) are accessible here.
+
+    using JpegRowCb = void(*)(void *ud, int sy, int img_w, const stbi_uc *rgb3);
+
+    /* Returns true on success.  out_w / out_h are filled with the decoded
+     * image dimensions (available after the call, before any frees).       */
+    static bool stream_jpeg(const stbi_io_callbacks *cbs, FileRegion *fr,
+                            int *out_w, int *out_h,
+                            JpegRowCb cb, void *ud)
+    {
+        stbi__context ctx;
+        stbi__start_callbacks(&ctx,
+            const_cast<stbi_io_callbacks*>(cbs),
+            static_cast<void*>(fr));
+
+        stbi__jpeg *j = static_cast<stbi__jpeg*>(malloc(sizeof(stbi__jpeg)));
+        if (!j) return false;
+        memset(j, 0, sizeof(stbi__jpeg));
+        j->s = &ctx;
+        stbi__setup_jpeg(j);
+
+        /* Decode all MCUs → YCbCr component rasters.
+         * This is where the per-image memory lives; we cannot avoid it
+         * without rewriting the JPEG MCU scan loop.                     */
+        if (!stbi__decode_jpeg_image(j)) {
+            stbi__cleanup_jpeg(j);
+            free(j);
+            return false;
+        }
+
+        const int img_x   = (int)ctx.img_x;
+        const int img_y   = (int)ctx.img_y;
+        if (out_w) *out_w = img_x;
+        if (out_h) *out_h = img_y;
+
+        const int n        = (ctx.img_n >= 3) ? 3 : 1;
+        const int is_rgb   = (ctx.img_n == 3) &&
+                             (j->rgb == 3 ||
+                              (j->app14_color_transform == 0 && !j->jfif));
+        const int decode_n = (ctx.img_n == 3 && n < 3 && !is_rgb)
+                             ? 1 : ctx.img_n;
+        if (decode_n <= 0) { stbi__cleanup_jpeg(j); free(j); return false; }
+
+        /* Set up chroma upsamplers — identical to load_jpeg_image. */
+        stbi__resample res_comp[4];
+        for (int k = 0; k < decode_n; ++k) {
+            stbi__resample *r = &res_comp[k];
+            j->img_comp[k].linebuf =
+                static_cast<stbi_uc*>(malloc(img_x + 3));
+            if (!j->img_comp[k].linebuf) {
+                stbi__cleanup_jpeg(j); free(j); return false;
+            }
+            r->hs      = j->img_h_max / j->img_comp[k].h;
+            r->vs      = j->img_v_max / j->img_comp[k].v;
+            r->ystep   = r->vs >> 1;
+            r->w_lores = (img_x + r->hs - 1) / r->hs;
+            r->ypos    = 0;
+            r->line0   = r->line1 = j->img_comp[k].data;
+            if      (r->hs == 1 && r->vs == 1) r->resample = resample_row_1;
+            else if (r->hs == 1 && r->vs == 2) r->resample = stbi__resample_row_v_2;
+            else if (r->hs == 2 && r->vs == 1) r->resample = stbi__resample_row_h_2;
+            else if (r->hs == 2 && r->vs == 2) r->resample = j->resample_row_hv_2_kernel;
+            else                               r->resample = stbi__resample_row_generic;
+        }
+
+        /* KEY: allocate ONE row instead of img_x * img_y * n bytes. */
+        stbi_uc *rowbuf = static_cast<stbi_uc*>(malloc(n * img_x + 1));
+        if (!rowbuf) { stbi__cleanup_jpeg(j); free(j); return false; }
+
+        for (int sy = 0; sy < img_y; ++sy) {
+            stbi_uc *out      = rowbuf;
+            stbi_uc *coutput[4] = {};
+
+            for (int k = 0; k < decode_n; ++k) {
+                stbi__resample *r = &res_comp[k];
+                const int y_bot  = r->ystep >= (r->vs >> 1);
+                coutput[k] = r->resample(j->img_comp[k].linebuf,
+                                         y_bot ? r->line1 : r->line0,
+                                         y_bot ? r->line0 : r->line1,
+                                         r->w_lores, r->hs);
+                if (++r->ystep >= r->vs) {
+                    r->ystep = 0;
+                    r->line0 = r->line1;
+                    if (++r->ypos < j->img_comp[k].y)
+                        r->line1 += j->img_comp[k].w2;
+                }
+            }
+
+            /* YCbCr→RGB: verbatim copy of load_jpeg_image's inner block. */
+            if (n >= 3) {
+                stbi_uc *y = coutput[0];
+                if (ctx.img_n == 3) {
+                    if (is_rgb) {
+                        for (int i = 0; i < img_x; ++i) {
+                            out[0]=y[i]; out[1]=coutput[1][i]; out[2]=coutput[2][i];
+                            out += 3;
+                        }
+                    } else {
+                        j->YCbCr_to_RGB_kernel(
+                            out, y, coutput[1], coutput[2], img_x, n);
+                    }
+                } else if (ctx.img_n == 4) {
+                    if (j->app14_color_transform == 0) {             /* CMYK */
+                        for (int i = 0; i < img_x; ++i) {
+                            stbi_uc m = coutput[3][i];
+                            out[0] = stbi__blinn_8x8(coutput[0][i], m);
+                            out[1] = stbi__blinn_8x8(coutput[1][i], m);
+                            out[2] = stbi__blinn_8x8(coutput[2][i], m);
+                            out[3] = 255; out += n;
+                        }
+                    } else if (j->app14_color_transform == 2) {      /* YCCK */
+                        j->YCbCr_to_RGB_kernel(
+                            out, y, coutput[1], coutput[2], img_x, n);
+                        for (int i = 0; i < img_x; ++i) {
+                            stbi_uc m = coutput[3][i];
+                            out[0] = stbi__blinn_8x8(255 - out[0], m);
+                            out[1] = stbi__blinn_8x8(255 - out[1], m);
+                            out[2] = stbi__blinn_8x8(255 - out[2], m);
+                            out += n;
+                        }
+                    } else {
+                        j->YCbCr_to_RGB_kernel(
+                            out, y, coutput[1], coutput[2], img_x, n);
+                    }
+                } else {
+                    for (int i = 0; i < img_x; ++i) {
+                        out[0]=out[1]=out[2]=coutput[0][i]; out[3]=255; out+=n;
+                    }
+                }
+            } else {
+                /* Grayscale / alpha output (n < 3). */
+                if (is_rgb) {
+                    for (int i = 0; i < img_x; ++i)
+                        *out++ = stbi__compute_y(
+                            coutput[0][i], coutput[1][i], coutput[2][i]);
+                } else {
+                    stbi_uc *yc = coutput[0];
+                    for (int i = 0; i < img_x; ++i) *out++ = yc[i];
+                }
+            }
+
+            cb(ud, sy, img_x, rowbuf);
+        }
+
+        free(rowbuf);
+        stbi__cleanup_jpeg(j);
+        free(j);
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
+    // Box-filter accumulator: collects decoded RGB rows and writes RGBA4444.
+    // -------------------------------------------------------------------------
+    // Maximum output square size we support via stack-allocated vacc.
+    // ArtSize() on Switch overlay ≈ 376 px — well within this limit.
+    static constexpr int kAccMaxSz = 512;
+
+    struct ArtAccum {
+        u8  *out4444;          /* m_art_rgba4444.data()                  */
+        int  dst;              /* output square size (pixels)             */
+        int  sw, sh;           /* source image dimensions                 */
+        u32  vacc[kAccMaxSz * 3]; /* RGB sums for current output row      */
+        u32  vcnt;             /* source rows accumulated so far          */
+        int  cur_oy;           /* output row we're currently filling      */
+    };
+
+    static void flush_accum(ArtAccum &a) {
+        if (a.vcnt == 0) return;
+        u8 *row = a.out4444 + a.cur_oy * a.dst * 2;
+        for (int ox = 0; ox < a.dst; ++ox) {
+            const u8 r = (u8)((a.vacc[ox*3  ] + a.vcnt/2) / a.vcnt);
+            const u8 g = (u8)((a.vacc[ox*3+1] + a.vcnt/2) / a.vcnt);
+            const u8 b = (u8)((a.vacc[ox*3+2] + a.vcnt/2) / a.vcnt);
+            row[ox*2  ] = ((r >> 4) << 4) | (g >> 4);
+            row[ox*2+1] = ((b >> 4) << 4) | 0xF;
+        }
+        memset(a.vacc, 0, sizeof(u32) * a.dst * 3);
+        a.vcnt = 0;
+    }
+
+    static void art_row_cb(void *ud, int sy, int sw, const stbi_uc *rgb) {
+        ArtAccum &a = *static_cast<ArtAccum*>(ud);
+        const int oy = (int)((long long)sy * a.dst / a.sh);
+
+        if (oy != a.cur_oy) {
+            flush_accum(a);
+            a.cur_oy = oy;
+        }
+
+        /* Horizontal box filter: for each output column, average the
+         * source pixels that map into it.  For typical art (1000 px source
+         * → 376 px output) each column covers ≈2-3 source pixels.         */
+        for (int ox = 0; ox < a.dst; ++ox) {
+            int xs = ox * sw / a.dst;
+            int xe = (ox + 1) * sw / a.dst;
+            if (xe <= xs) xe = xs + 1;
+            u32 sr = 0, sg = 0, sb = 0;
+            for (int x = xs; x < xe; ++x) {
+                sr += rgb[x*3]; sg += rgb[x*3+1]; sb += rgb[x*3+2];
+            }
+            const u32 cnt = (u32)(xe - xs);
+            a.vacc[ox*3  ] += (sr + cnt/2) / cnt;
+            a.vacc[ox*3+1] += (sg + cnt/2) / cnt;
+            a.vacc[ox*3+2] += (sb + cnt/2) / cnt;
+        }
+        ++a.vcnt;
+    }
+
 } // namespace
 
 // =============================================================================
@@ -469,14 +693,21 @@ bool StatusBar::onClick(u64 keys) {
     }
     if (keys & KEY_RIGHT) {
         if (m_active_btn == 5) { NudgeSeek(+1, 5); return true; }
-        if (m_active_btn < 4) { m_active_btn++; triggerNavigationFeedback(); }
+        if (m_active_btn < 4) {
+            m_active_btn++;
+            triggerNavigationFeedback();
+        }
         else if (m_on_page_right) m_on_page_right();
         return true;
     }
     if (keys & KEY_LEFT) {
         if (m_r_held) return true;  /* R held = nav mode, ignore */
         if (m_active_btn == 5) { NudgeSeek(-1, 5); return true; }
-        if (m_active_btn > 0) { m_active_btn--; triggerNavigationFeedback(); return true; }
+        if (m_active_btn > 0) {
+            m_active_btn--;
+            triggerNavigationFeedback();
+            return true;
+        }
         return false;
     }
     return false;
@@ -499,7 +730,7 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
             if (m_art_valid) {
                 renderer->drawBitmapRGBA4444(art_x, this->getY() + 6,
                                              art_sz, art_sz, m_art_rgba4444.data(),
-                                             tsl::gfx::Renderer::s_opacity, true);
+                                             tsl::gfx::Renderer::s_opacity, false);
             }
 
             /* Overlay a music note when no real art was found. */
@@ -691,7 +922,7 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
             highlightColor = lerpColor(tsl::highlightColor1, tsl::highlightColor2, progress);
         }
 
-        auto [cx, cy] = ButtonCenter(m_active_btn);
+        const auto [cx, cy] = ButtonCenter(m_active_btn);
         const s32 btn_r = (m_active_btn == 2) ? 24
                         : (m_active_btn == 0 || m_active_btn == 4) ? 18 : 20;
 
@@ -775,7 +1006,7 @@ void StatusBar::layout(u16 parentX, u16 parentY, u16 parentWidth, u16 parentHeig
     s32 new_w = this->getWidth() + 9;
     s32 art   = (new_w - 30) * 9 / 10;
     s32 new_h = art + 14 + tsl::style::ListItemDefaultHeight * 3;
-    this->setBoundaries(this->getX() + 3, this->getY(), new_w, new_h);
+    this->setBoundaries(parentX + 3, parentY, new_w, new_h);
 
     if (m_art_scaled_size == 0 && !m_last_full_path.empty())
         loadArt(m_last_full_path.c_str());
@@ -992,42 +1223,79 @@ bool StatusBar::loadArt(const char *fullPath) {
     m_artist_counter      = 0;
     m_artist_truncated    = false;
 
-    if (!tags.art.valid() || ult::limitedMemory) {
+    if (!tags.art.valid()) {
         fclose(f);
         fill_placeholder();
         return true;
     }
+
+    /* Detect JPEG (FF D8) vs other formats (PNG etc.).
+     * The streaming decoder only works for JPEG — other formats fall
+     * through to the regular stbi_load path.                          */
+    u8 magic2[2] = {};
+    fseek(f, tags.art.offset, SEEK_SET);
+    fread(magic2, 1, 2, f);
+    const bool is_jpeg = (magic2[0] == 0xFF && magic2[1] == 0xD8);
 
     fseek(f, tags.art.offset, SEEK_SET);
     FileRegion fr{ f, tags.art.offset + (long)tags.art.size };
 
-    /* Check image dimensions BEFORE allocating the decode buffer.
-     * stbi_info reads only the compressed header — negligible cost.
-     * Without this, a 2048×2048 JPEG would allocate ~12 MB only to
-     * be freed immediately when the post-decode size check fires. */
+    /* Dimension check via stbi_info (reads only the compressed header).
+     *
+     * Budget rationale (4 MB heap):
+     *   JPEG streaming:  peak ≈ iw×ih×1.5 (YCbCr component rasters)
+     *                         + iw×3      (one row buffer, negligible)
+     *                    → cap at ~1200×1200: 1200²×1.5 ≈ 2.16 MB, fits.
+     *   Non-JPEG:        peak ≈ iw×ih×4.5 (component + full RGB output)
+     *                    → cap at 640×640: 640²×4.5 ≈ 1.84 MB, fits.  */
+    constexpr long kMaxJpegPixels  = 1200L * 1200L;
+    constexpr long kMaxOtherPixels =  640L *  640L;
+    const     long kMaxPixels      = is_jpeg ? kMaxJpegPixels : kMaxOtherPixels;
+
     int iw = 0, ih = 0, ich = 0;
     if (!stbi_info_from_callbacks(&k_stbi_cbs, &fr, &iw, &ih, &ich)
-        || iw <= 0 || ih <= 0 || iw > 2048 || ih > 2048) {
+        || iw <= 0 || ih <= 0
+        || (long)iw * ih > kMaxPixels) {
         fclose(f);
         fill_placeholder();
         return true;
     }
 
-    /* Re-seek: stbi_info advanced the file pointer into the image stream. */
+    /* Re-seek after stbi_info advanced the file pointer. */
     fseek(f, tags.art.offset, SEEK_SET);
     fr = { f, tags.art.offset + (long)tags.art.size };
 
-    u8 *px = stbi_load_from_callbacks(&k_stbi_cbs, &fr, &iw, &ih, &ich, 3);
-    fclose(f);
+    if (is_jpeg && sz <= kAccMaxSz) {
+        /* ── Streaming JPEG path ──────────────────────────────────────────
+         * Peak allocation: iw×ih×1.5 (component rasters) + iw×3 (row buf)
+         * The full iw×ih×3 RGB output buffer is never allocated.
+         * ArtAccum lives on the stack: vacc is kAccMaxSz×3×4 = 6 KB.    */
+        ArtAccum accum{};
+        accum.out4444 = m_art_rgba4444.data();
+        accum.dst     = sz;
+        accum.sw      = iw;
+        accum.sh      = ih;
+        accum.cur_oy  = 0;
 
-    if (!px) {
-        fill_placeholder();
-        return true;
+        int dw = 0, dh = 0;
+        const bool ok = stream_jpeg(&k_stbi_cbs, &fr, &dw, &dh,
+                                    art_row_cb, &accum);
+        fclose(f);
+
+        if (!ok) { fill_placeholder(); return true; }
+
+        /* Flush the final output row (the callback only flushes on
+         * transitions, so the last accumulated row is still pending). */
+        flush_accum(accum);
+
+    } else {
+        /* ── Fallback: regular stbi_load (non-JPEG or sz > kAccMaxSz) ─── */
+        u8 *px = stbi_load_from_callbacks(&k_stbi_cbs, &fr, &iw, &ih, &ich, 3);
+        fclose(f);
+        if (!px) { fill_placeholder(); return true; }
+        toRGBA4444_from_RGB(px, iw, ih, sz, m_art_rgba4444.data());
+        stbi_image_free(px);
     }
-
-    /* iw/ih are guaranteed within [1..2048] by the info check above. */
-    toRGBA4444_from_RGB(px, iw, ih, sz, m_art_rgba4444.data());
-    stbi_image_free(px);
 
     m_art_scaled_size = sz;
     m_art_valid       = true;

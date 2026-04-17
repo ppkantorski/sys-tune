@@ -96,7 +96,6 @@ tsl::elm::Element* MainGui::createUI() {
 
     m_status_bar->setPageRightCallback([] {
         g_player_r_held.store(false, std::memory_order_release);
-        triggerNavigationFeedback();
         if (g_player_right_dest == PlayerRightDest::Playlist) {
             /* swapTo replaces MainGui with SettingsGui, then changeTo stacks
                PlaylistGui on top: [SettingsGui, PlaylistGui].
@@ -113,6 +112,7 @@ tsl::elm::Element* MainGui::createUI() {
         } else {
             tsl::swapTo<SettingsGui>();
         }
+        triggerNavigationFeedback();
     });
 
     // Pre-warm before the first draw so m_playing and m_percentage are already
@@ -170,7 +170,6 @@ bool MainGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touch
 
     if (ult::simulatedNextPage.exchange(false, std::memory_order_acq_rel)) {
         g_player_r_held.store(false, std::memory_order_release);
-        triggerNavigationFeedback();
         if (g_player_right_dest == PlayerRightDest::Playlist) {
             play_ctx::poll();
             tsl::swapTo<SettingsGui>();
@@ -182,6 +181,7 @@ bool MainGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touch
         } else {
             tsl::swapTo<SettingsGui>();
         }
+        triggerNavigationFeedback();
         return true;
     }
 
@@ -193,7 +193,6 @@ bool MainGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touch
     if (m_status_bar->hasFocus() && (keysHeld & KEY_R)) {
         if ((keysDown & KEY_RIGHT) && !(keysHeld & ~KEY_RIGHT & ~KEY_R & ALL_KEYS_MASK)) {
             g_player_r_held.store(false, std::memory_order_release);
-            triggerNavigationFeedback();
             if (g_player_right_dest == PlayerRightDest::Playlist) {
                 play_ctx::poll();
                 tsl::swapTo<SettingsGui>();
@@ -205,6 +204,7 @@ bool MainGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touch
             } else {
                 tsl::swapTo<SettingsGui>();
             }
+            triggerNavigationFeedback();
             return true;
         }
     }
@@ -216,7 +216,6 @@ bool MainGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touch
              && (ult::unlockedSlide.load(std::memory_order_acquire) || ult::allowSlide.load(std::memory_order_acquire))
              && !(keysHeld & KEY_R))) {
         g_player_r_held.store(false, std::memory_order_release);
-        triggerNavigationFeedback();
         if (g_player_right_dest == PlayerRightDest::Playlist) {
             play_ctx::poll();
             tsl::swapTo<SettingsGui>();
@@ -228,6 +227,7 @@ bool MainGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &touch
         } else {
             tsl::swapTo<SettingsGui>();
         }
+        triggerNavigationFeedback();
         return true;
     }
 
@@ -455,7 +455,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     });
     m_list->addItem(startup_button);
 
-    auto exit_button = new tsl::elm::ListItem("Stop sys-tune");
+    auto exit_button = new tsl::elm::SilentListItem("Stop sys-tune");
     exit_button->setValue("\uE071", true);
     exit_button->setClickListener([exit_button](u64 keys) -> bool {
         if (keys & HidNpadButton_A) {
@@ -550,8 +550,8 @@ bool SettingsGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &t
 
     if (ult::simulatedNextPage.exchange(false, std::memory_order_acq_rel)) {
         setPlayerRightDest(PlayerRightDest::Settings);
-        triggerNavigationFeedback();
         tsl::swapTo<MainGui>();
+        triggerNavigationFeedback();
         return true;
     }
 
@@ -601,8 +601,8 @@ bool SettingsGui::handleInput(u64 keysDown, u64 keysHeld, const HidTouchState &t
         && !(ult::onTrackBar.load(std::memory_order_acquire)
              && (ult::unlockedSlide.load(std::memory_order_acquire) || ult::allowSlide.load(std::memory_order_acquire)))) {
         setPlayerRightDest(PlayerRightDest::Settings);
-        triggerNavigationFeedback();
         tsl::swapTo<MainGui>();
+        triggerNavigationFeedback();
         return true;
     }
     return false;
