@@ -246,6 +246,41 @@ namespace tune::impl {
         bool g_should_run        = true;
 
         /* --------------------------------------------------------------
+         * User-action tracking for the pause/play policy engine.
+         *
+         * g_should_pause is written by two classes of actor:
+         *
+         *   Policy engine — PmdmntThreadFunc applies "Pause On Start"
+         *                   and "Pause On Home" rules when titles
+         *                   change or focus flips.
+         *
+         *   User action   — Play() / Pause() / Next() / Prev() /
+         *                   Select() triggered from the overlay.
+         *
+         * User intent is asymmetric:
+         *
+         *   - Pause is a STRONG signal ("I want silence"). A manual
+         *     pause must survive title changes, HOME presses, and
+         *     game re-entries until the user explicitly unpauses.
+         *
+         *   - Play is a WEAK signal ("resume now"). Tapping Play does
+         *     NOT veto future auto-pauses — e.g. Pause On Home should
+         *     still fire when the user presses HOME after tapping Play.
+         *
+         * g_user_paused encodes this as a ONE-WAY veto: while set, the
+         * policy engine cannot write g_should_pause = false. The policy
+         * engine can still write g_should_pause = true freely (those
+         * writes align with the user's intent anyway).
+         *
+         * g_saved_pause_state is the snapshot captured at focus-loss
+         * (HOME press). It's a global rather than a local because user
+         * actions performed during a HOME visit must update it so that
+         * returning to the game restores the user's LATEST intent, not
+         * a stale pre-HOME value. */
+        bool g_user_paused       = false;
+        bool g_saved_pause_state = false;
+
+        /* --------------------------------------------------------------
          * pdmqry-based focus detection.
          *
          * pmdmnt reports which process is FOREGROUND, but when the user
@@ -611,9 +646,9 @@ namespace tune::impl {
          * out of focus. We treat that as a SUSPENSION of the game's
          * playback state:
          *
-         *   focused -> unfocused  : save g_should_pause, apply HOME's
-         *                           "Pause On Home" policy.
-         *   unfocused -> focused  : restore the saved g_should_pause.
+         *   focused -> unfocused  : snapshot g_should_pause, apply
+         *                           HOME's "Pause On Home" policy.
+         *   unfocused -> focused  : restore the snapshotted state.
          *                           (A startup setting shouldn't re-fire
          *                            every time the user returns from HOME.)
          *   tid change (focused)  : genuine game switch — apply new
@@ -623,15 +658,21 @@ namespace tune::impl {
          * returns true when the foreground PROCESS changes. Pressing
          * HOME during a game does not change the process (the game is
          * suspended, not closed), so PollCurrentPidTid stays silent.
-         * We must therefore poll pdmqry EVERY tick, not just on tid
-         * changes, to observe focus flips.
+         * We must therefore poll pdmqry EVERY tick to observe focus
+         * flips.
+         *
+         * USER VETO: if the user has manually Paused, g_user_paused is
+         * set and the policy engine cannot UNPAUSE the music until the
+         * user Plays again. The policy engine CAN still pause (those
+         * writes align with user intent anyway). This is implemented
+         * by routing every policy write through policyWrite().
          *
          * First poll: whatever we observe, apply the title's startup
          * setting so the Initialize()-set pause is lifted (or not)
          * correctly. No audio reaches audout until this resolves.
          *
          * Per-title VOLUME is orthogonal — always applied on every tid
-         * change, regardless of focus.
+         * change, regardless of focus or user state.
          *
          * If pdmqry is unavailable we can't detect HOME, so we fall
          * back to the symmetric non-focus-aware behaviour (apply the
@@ -639,17 +680,44 @@ namespace tune::impl {
 
         constexpr u64 kHomeScreenTid = 0x0100000000001000ULL;
 
-        auto resolveTitleEnabled = [](u64 tid) -> bool {
-            return config::has_title_enabled(tid)
-                ? config::get_title_enabled(tid)
-                : config::get_title_enabled_default();
+        /* Tri-state policy for title transitions.
+         *
+         *   ForcePlay  — Play On Start is ON for this title
+         *                (config::title_enabled(tid) = true)
+         *   ForcePause — Pause On Start is ON for this title
+         *                (config::title_pause_on_start(tid) = true)
+         *   DoNothing  — neither key is set; keep whatever was playing
+         *
+         * HOME focus-loss uses the same resolver: "Pause On Home" in the
+         * UI writes title_pause_on_start(kHomeScreenTid), so a configured
+         * HOME always yields ForcePause; an unconfigured HOME yields
+         * DoNothing (no surprise-pause on first launch). */
+        enum class StartAction { DoNothing, ForcePlay, ForcePause };
+
+        auto resolvePerTitlePolicy = [](u64 tid) -> StartAction {
+            /* Pause On Start takes priority if somehow both keys are set
+             * (mutual exclusion is enforced by the UI, but be defensive). */
+            if (config::has_title_pause_on_start(tid) &&
+                config::get_title_pause_on_start(tid))
+                return StartAction::ForcePause;
+            if (config::has_title_enabled(tid) &&
+                config::get_title_enabled(tid))
+                return StartAction::ForcePlay;
+            return StartAction::DoNothing;
         };
 
-        bool first_poll        = true;
-        u64  current_tid       = 0;      // tracks the foreground tid across ticks
-        u64  current_pid       = 0;      // tracks foreground pid for volume IPC
-        bool last_focused      = true;   // focus state observed last tick
-        bool saved_pause_state = false;  // g_should_pause snapshot at focus-loss
+        /* One-way veto: policy can pause freely but cannot unpause
+         * while the user has explicitly paused. */
+        auto policyWrite = [](bool should_pause) {
+            if (!should_pause && g_user_paused)
+                return;  // veto: user's Pause outranks this unpause
+            g_should_pause = should_pause;
+        };
+
+        bool first_poll   = true;
+        u64  current_tid  = 0;     // tracks the foreground tid across ticks
+        u64  current_pid  = 0;     // tracks foreground pid for volume IPC
+        bool last_focused = true;  // focus state observed last tick
 
         while (g_should_run) {
             /* ---- (1) Tid-change edge: update current_tid + volume ---- */
@@ -658,7 +726,9 @@ namespace tune::impl {
                 if (pm::PollCurrentPidTid(&new_pid, &new_tid)) {
                     current_pid = new_pid;
 
-                    /* Per-title volume — always applied on tid change. */
+                    /* Per-title volume — always applied on tid change,
+                     * regardless of user state (volume is separate from
+                     * pause/play). */
                     g_title_volume = 1.f;
                     if (config::has_title_volume(new_tid)) {
                         g_use_title_volume = true;
@@ -666,21 +736,26 @@ namespace tune::impl {
                     }
 
                     if (first_poll) {
-                        /* Boot: apply the startup policy for whatever tid
-                         * we see. Lifts the Initialize()-set pause for
-                         * play-on-start titles. */
-                        g_should_pause = !resolveTitleEnabled(new_tid);
-                        current_tid    = new_tid;
-                        first_poll     = false;
-                        /* last_focused initialised to true above — correct
-                         * initial value for a freshly-launched foreground. */
+                        /* Boot: use the global Auto-play Startup toggle.
+                         * Per-title Play/Pause On Start are intentionally
+                         * ignored at boot — the sysmodule may be spawned
+                         * from any title or HOME, and the user's intent is
+                         * captured by the single "should music play when
+                         * the module starts?" question. */
+                        policyWrite(!config::get_auto_play_startup());
+                        current_tid = new_tid;
+                        first_poll  = false;
                     } else {
-                        /* Genuine title change (different process foreground).
-                         * Apply the new title's Pause On Start policy and
-                         * reset focus tracking for the new tid. */
-                        g_should_pause = !resolveTitleEnabled(new_tid);
-                        current_tid    = new_tid;
-                        last_focused   = true;   // new foreground starts focused
+                        /* Genuine title change. Apply the per-title policy. */
+                        const auto action = resolvePerTitlePolicy(new_tid);
+                        if (action == StartAction::ForcePlay)
+                            policyWrite(false);
+                        else if (action == StartAction::ForcePause)
+                            policyWrite(true);
+                        /* DoNothing: leave g_should_pause as-is. */
+
+                        current_tid  = new_tid;
+                        last_focused = true;   // new foreground starts focused
                     }
                 }
             }
@@ -694,14 +769,21 @@ namespace tune::impl {
                     if (new_focused != last_focused) {
                         if (!new_focused) {
                             /* Pressed HOME while in a game.
-                             * Snapshot current state and apply HOME's policy. */
-                            saved_pause_state = g_should_pause;
-                            g_should_pause    = !resolveTitleEnabled(kHomeScreenTid);
+                             * Snapshot current state, then apply HOME's
+                             * Pause On Home policy (if configured).
+                             * DoNothing → keep playing through the HOME visit. */
+                            g_saved_pause_state = g_should_pause;
+                            const auto action = resolvePerTitlePolicy(kHomeScreenTid);
+                            if (action == StartAction::ForcePause)
+                                policyWrite(true);
+                            else if (action == StartAction::ForcePlay)
+                                policyWrite(false);
+                            /* DoNothing: leave playback state unchanged. */
                         } else {
                             /* Returned to the same game from HOME.
-                             * Restore pre-HOME state (don't re-apply
-                             * Pause On Start — that's a startup setting). */
-                            g_should_pause = saved_pause_state;
+                             * Restore snapshotted state (possibly updated
+                             * during the HOME visit by user actions). */
+                            policyWrite(g_saved_pause_state);
                         }
                         last_focused = new_focused;
                     }
@@ -730,11 +812,15 @@ namespace tune::impl {
     }
 
     void Play() {
-        g_should_pause = false;
+        g_should_pause       = false;
+        g_user_paused        = false;  // clears the pause-veto
+        g_saved_pause_state  = false;  // keep focus-suspend snapshot in sync
     }
 
     void Pause() {
-        g_should_pause = true;
+        g_should_pause       = true;
+        g_user_paused        = true;   // one-way veto: policy cannot unpause us
+        g_saved_pause_state  = true;   // keep focus-suspend snapshot in sync
     }
 
     void Next() {
@@ -750,8 +836,10 @@ namespace tune::impl {
                     pause = true;
             }
         }
-        g_status     = PlayerStatus::FetchNext;
-        g_should_pause = pause;
+        g_status             = PlayerStatus::FetchNext;
+        g_should_pause       = pause;
+        g_user_paused        = pause;  // honour end-of-queue stop as an intentional pause
+        g_saved_pause_state  = pause;
     }
 
     void Prev() {
@@ -764,8 +852,10 @@ namespace tune::impl {
                 g_queue_position = g_playlist.Size() - 1;
             }
         }
-        g_status     = PlayerStatus::FetchNext;
-        g_should_pause = false;
+        g_status             = PlayerStatus::FetchNext;
+        g_should_pause       = false;
+        g_user_paused        = false;
+        g_saved_pause_state  = false;
     }
 
     float GetVolume() {
@@ -914,8 +1004,10 @@ namespace tune::impl {
 
             g_queue_position = std::min(index, size - 1);
         }
-        g_status     = PlayerStatus::FetchNext;
-        g_should_pause = false;
+        g_status             = PlayerStatus::FetchNext;
+        g_should_pause       = false;
+        g_user_paused        = false;
+        g_saved_pause_state  = false;
     }
 
     void Seek(u32 position) {
