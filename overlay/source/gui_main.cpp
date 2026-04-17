@@ -482,7 +482,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     });
     m_list->addItem(startup_button);
 
-    auto exit_button = new tsl::elm::ListItem("Stop sys-tune");
+    auto exit_button = new tsl::elm::SilentListItem("Stop sys-tune");
     exit_button->setValue("\uE071", true);
     exit_button->setClickListener([exit_button](u64 keys) -> bool {
         if (keys & HidNpadButton_A) {
