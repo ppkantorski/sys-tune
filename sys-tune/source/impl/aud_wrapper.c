@@ -12,9 +12,9 @@ Result audWrapperInitialize(void) {
 
 void audWrapperExit(void) {
     if (hosversionBefore(11,0,0))
-        audoutaInitialize();
+        audoutaExit();
     else
-        audaInitialize();
+        audaExit();
 }
 
 Result audWrapperRequestSuspend(u64 pid, u64 delay) {

@@ -772,8 +772,26 @@ namespace tune::impl {
 
         bool first_poll   = true;
         u64  current_tid  = 0;     // tracks the foreground tid across ticks
-        u64  current_pid  = 0;     // tracks foreground pid for volume IPC
-        bool last_focused = true;  // focus state observed last tick
+        u64  current_pid     = 0;     // tracks foreground pid for volume IPC
+        bool last_focused    = true;  // focus state observed last tick
+        bool s_vol_needs_reapply  = false; // set on focus-loss AND focus-return; triggers vol write
+        bool s_in_vol_transition  = false; // true during tight-poll window after focus flip; drives 1 ms sleep
+
+        /* Immediately write sys-tune's per-title master volume to the
+         * foreground game process.  Called at the TOP of each focus
+         * transition branch, BEFORE any blocking fadeIn/fadeOut, so the
+         * game audio correction and the music fade start simultaneously.
+         * Section (3)'s s_transition_ticks window then keeps correcting
+         * for any post-resume system audproc reset.
+         * Must be defined AFTER current_pid so the [&] capture is valid. */
+        auto applyTitleVolNow = [&]() {
+            if (!current_pid) return;
+            const auto v = g_use_title_volume ? g_title_volume : g_default_title_volume;
+            if (R_SUCCEEDED(audWrapperInitialize())) {
+                audWrapperSetProcessMasterVolume(current_pid, 0, v);
+                audWrapperExit();
+            }
+        };
 
         while (g_should_run) {
             /* ---- (1) Tid-change edge: update current_tid + volume ---- */
@@ -872,9 +890,24 @@ namespace tune::impl {
                     if (new_focused != last_focused) {
                         if (!new_focused) {
                             /* Pressed HOME while in a game.
-                             * Snapshot current state, then apply HOME's
-                             * Pause On Home policy (if configured).
-                             * DoNothing → keep playing through the HOME visit. */
+                             *
+                             * Do NOT call applyTitleVolNow() here.  Two reasons:
+                             *
+                             *   (1) UltraGB calls gb_game_vol_suppress() at the
+                             *       same moment, which intentionally restores the
+                             *       game audproc to 1.0 before the game sleeps.
+                             *       Writing our per-title level on top of that
+                             *       races with — and undoes — that suppress,
+                             *       making the game audio briefly audible at the
+                             *       sys-tune level during the HOME transition.
+                             *
+                             *   (2) The Switch resets audproc during the RESUME
+                             *       sequence (not the suspend), so any write here
+                             *       gets overwritten before it can help anyway.
+                             *       The HOME-return branch below is the right
+                             *       place to apply the correction.
+                             *
+                             * Snapshot state and apply HOME's pause policy. */
                             g_saved_pause_state = g_should_pause;
                             const auto action = resolvePerTitlePolicy(kHomeScreenTid);
                             if (action == StartAction::ForcePause)
@@ -890,7 +923,29 @@ namespace tune::impl {
                         } else {
                             /* Returned to the same game from HOME.
                              *
-                             * Treated identically to a fresh title launch:
+                             * Only assert the per-title volume immediately if
+                             * sys-tune's configured level differs from the system
+                             * default of 1.0.  If it IS 1.0 (user hasn't set a
+                             * custom level), the system's own audproc reset to
+                             * 1.0 on resume is already correct — there's nothing
+                             * to fix, and aggressively writing 1.0 for 50 ms
+                             * would block UltraGB from re-applying its own level.
+                             *
+                             * When sys-tune DOES have a custom non-1.0 level:
+                             * applyTitleVolNow() fires first so the game audio
+                             * and music fade start simultaneously, then
+                             * s_transition_ticks sustains the correction for 50 ms
+                             * to catch the post-resume audproc reset. */
+                            {
+                                const auto v_now = g_use_title_volume
+                                    ? g_title_volume : g_default_title_volume;
+                                if (std::fabs(v_now - 1.0f) > 0.01f) {
+                                    applyTitleVolNow();
+                                    s_vol_needs_reapply = true;
+                                }
+                            }
+
+                            /* Treated identically to a fresh title launch:
                              *
                              *   ForcePlay  → always play (clears manual-pause
                              *                veto, mirrors first-launch behaviour).
@@ -925,36 +980,130 @@ namespace tune::impl {
                  * itself, applet, etc.) — leave focus state untouched. */
             }
 
-            /* ---- (3) Continuously apply per-title master volume ---- */
-            // The volume cannot be applied just once at title change because
-            // the game may not have opened its audio services yet. Instead we
-            // apply it on every tick for a short settling window after each
-            // pid change (~300 ms = 30 ticks x 10 ms), which covers even
-            // slow-launching games. After that we only re-apply when the
-            // value itself changes, eliminating the steady-state IPC cost.
+            /* ---- (3) Apply per-title master volume on legitimate events only ----
+             *
+             * Three write triggers:
+             *
+             *   (a) PID change — game audio process may not be registered yet,
+             *       so retry on failure up to 300 ms.  Stop on first success.
+             *
+             *   (b) g_title_volume changed — user moved the slider.  One write.
+             *
+             *   (c) Focus transition (HOME press and HOME return) — uses a
+             *       dedicated s_transition_ticks window that keeps writing every
+             *       tick for 300 ms EVEN AFTER a successful write.  This is
+             *       necessary because the Switch resets the process's audproc
+             *       volume during its resume sequence, AFTER the focus-return
+             *       event is posted to pdmqry and AFTER our first write lands.
+             *       A single write therefore gets silently overwritten by the
+             *       system, producing the brief full-volume flash.  Writing
+             *       every 10 ms for 300 ms means any system reset is corrected
+             *       within one tick — imperceptible to the user.
+             *       Outside this window sys-tune is event-driven and never
+             *       writes in steady state, so UltraGB cooperation is intact.
+             */
             if (current_pid) {
                 const auto v = g_use_title_volume ? g_title_volume : g_default_title_volume;
-                static u64   s_last_vol_pid = 0;
-                static float s_last_vol     = -1.f;
-                static int   s_settle_ticks = 0;
+                static u64   s_last_vol_pid     = 0;
+                static float s_last_vol         = -1.f;
+                static int   s_retry_ticks      = 0;   // fail-retry window after PID change
+                static bool  s_applied_ok       = false;
+                static int   s_transition_ticks = 0;   // sustained write window after focus flip
 
                 if (current_pid != s_last_vol_pid) {
-                    // New title: reset settle counter and force first application.
-                    s_last_vol_pid = current_pid;
-                    s_last_vol     = -1.f;  // force re-apply
-                    s_settle_ticks = 30;    // 30 x 10 ms = 300 ms settling window
+                    s_last_vol_pid     = current_pid;
+                    s_last_vol         = -1.f;
+                    s_retry_ticks      = 30;
+                    s_applied_ok       = false;
+                    s_transition_ticks = 0;
                 }
 
-                if (s_settle_ticks > 0 || v != s_last_vol) {
-                    audWrapperSetProcessMasterVolume(current_pid, 0, v);
-                    // audWrapperSetProcessRecordVolume(current_pid, 0, v);
-                    s_last_vol = v;
-                    if (s_settle_ticks > 0)
-                        --s_settle_ticks;
+                if (s_vol_needs_reapply) {
+                    s_applied_ok        = false;
+                    s_retry_ticks       = 30;
+                    s_last_vol          = -1.f;
+                    s_transition_ticks  = 50;   // 50 × 1 ms = 50 ms tight-poll window; the
+                                                // per-tick sleep shrinks to 1 ms while this
+                                                // is non-zero so any post-resume audproc reset
+                                                // is corrected within 1 ms, not up to 10 ms.
+                    s_vol_needs_reapply = false;
+                }
+
+                const bool value_changed = (v != s_last_vol);
+                const bool need_write    = value_changed
+                                        || (!s_applied_ok && s_retry_ticks > 0)
+                                        || (s_transition_ticks > 0);
+
+                if (need_write) {
+                    // Open aud:a only for the duration of the write then release
+                    // immediately — MaxSessions=1 means holding it continuously
+                    // blocks UltraGB from acquiring the service.
+                    Result rc = audWrapperInitialize();
+                    if (R_SUCCEEDED(rc)) {
+                        rc = audWrapperSetProcessMasterVolume(current_pid, 0, v);
+                        // audWrapperSetProcessRecordVolume(current_pid, 0, v);
+                        audWrapperExit();
+                    }
+                    if (R_SUCCEEDED(rc)) {
+                        s_last_vol    = v;
+                        s_applied_ok  = true;
+                        s_retry_ticks = 0;
+                        // Do NOT zero s_transition_ticks on success — the system
+                        // may still reset audproc after this write.
+                    } else if (s_retry_ticks > 0) {
+                        --s_retry_ticks;
+                    } else if (s_transition_ticks == 0) {
+                        s_last_vol = v;              // give up outside any active window
+                    }
+                    if (s_transition_ticks > 0) --s_transition_ticks;
+                }
+                s_in_vol_transition = (s_transition_ticks > 0);
+
+                /* ---- Audproc watchdog ----
+                 *
+                 * Some system events (battery/power-cord notifications,
+                 * friend-card overlays, etc.) reset the foreground process's
+                 * audproc to 1.0 WITHOUT generating a pdmqry InFocus event.
+                 * Because the focus-transition path is never triggered, the
+                 * 1.0 sticks indefinitely.
+                 *
+                 * Every ~5 s in steady state, read the current audproc value.
+                 * If it is at the system default of 1.0 AND sys-tune's
+                 * configured level for this title is something other than 1.0,
+                 * the delta is unambiguously a system reset (UltraGB would
+                 * never write 1.0 intentionally).  Trigger a one-shot
+                 * correction via the normal retry path.
+                 *
+                 * The read opens aud:a briefly (~µs) every 5 s — negligible
+                 * IPC overhead.  The watchdog is suppressed during any active
+                 * write window (transition or retry) to avoid redundancy. */
+                static int s_watchdog_ticks = 0;
+                if (s_applied_ok && s_transition_ticks == 0 && s_retry_ticks == 0
+                        && std::fabs(v - 1.0f) > 0.01f) {
+                    if (++s_watchdog_ticks >= 500) {   // ~5 s at 10 ms/tick
+                        s_watchdog_ticks = 0;
+                        float measured = -1.f;
+                        if (R_SUCCEEDED(audWrapperInitialize())) {
+                            audWrapperGetProcessMasterVolume(current_pid, &measured);
+                            audWrapperExit();
+                        }
+                        if (measured >= 0.f && std::fabs(measured - 1.0f) < 0.005f) {
+                            /* audproc is at system default but we want something
+                             * else — looks like a silent system reset.  Re-apply. */
+                            s_applied_ok  = false;
+                            s_retry_ticks = 30;
+                            s_last_vol    = -1.f;
+                        }
+                    }
+                } else {
+                    s_watchdog_ticks = 0;   // reset counter during active write windows
                 }
             }
 
-            svcSleepThread(10'000'000);
+            // Tight-poll during the focus-transition window (1 ms) so any
+            // post-resume audproc reset is caught and corrected within 1 ms.
+            // Outside that window use the normal 10 ms cadence.
+            svcSleepThread(s_in_vol_transition ? 1'000'000ULL : 10'000'000ULL);
         }
     }
 

@@ -34,7 +34,12 @@ void __appInit() {
 
     R_ABORT_UNLESS(gpioInitialize());
     R_ABORT_UNLESS(fsInitialize());
-    R_ABORT_UNLESS(audWrapperInitialize());
+    // aud:a / audout:a is admin-audio and has MaxSessions=1 in practice.
+    // Do NOT hold a global session here — that starves out any other tool
+    // (e.g. UltraGB) that tries to open its own session for per-process
+    // volume control.  music_player.cpp opens and closes the service
+    // around each individual write in PmdmntThreadFunc instead, so the
+    // service is available to other consumers >99% of the time.
     R_ABORT_UNLESS(pm::Initialize());
     R_ABORT_UNLESS(sdmc::Open());
 }
@@ -42,7 +47,6 @@ void __appInit() {
 void __appExit(void) {
     sdmc::Close();
     pm::Exit();
-    audWrapperExit();
     fsExit();
     gpioExit();
     smExit();

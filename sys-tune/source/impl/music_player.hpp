@@ -3,6 +3,7 @@
 #include "../tune_types.hpp"
 #include <string>
 #include <vector>
+#include <cmath>
 
 namespace tune::impl {
 
