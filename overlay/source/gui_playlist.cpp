@@ -313,17 +313,39 @@ PlaylistGui::PlaylistGui(std::function<void(u32)> on_count_changed)
                 if (ok) {
                     const s32 nextIndex = (index + 1 < this->m_list->getLastIndex())
                         ? index + 1 : index - 1;
+                
                     this->removeFocus();
                     this->m_list->removeIndex(index);
-                    this->m_list->setFocusedIndex(nextIndex);
-
+                
                     if ((size_t)tune_index < this->m_items.size())
                         this->m_items.erase(this->m_items.begin() + tune_index);
-
+                
+                    // ---- NEW: handle empty playlist case -------------------------
+                    if (this->m_items.empty()) {
+                        this->m_list->clear();
+                
+                        m_list->addItem(new tsl::elm::CustomDrawer(
+                            [](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+                                const size_t ix = x + (w - r->getTextDimensions("\uE150", false, 90).first) / 2;
+                                r->drawString("\uE150", false, ix, y + (h / 2) - 10 + 30, 90, tsl::defaultTextColor);
+                
+                                const size_t tx = x + (w - r->getTextDimensions("Playlist is empty!", false, 25).first) / 2;
+                                r->drawString("Playlist is empty!", false, tx, y + (h / 2) + 90 + 30, 25, tsl::defaultTextColor);
+                            }), 380);
+                
+                        notifyCountChanged(m_on_count_changed);
+                        triggerMoveFeedback();
+                        return true;
+                    }
+                    // --------------------------------------------------------------
+                
+                    // Re-number remaining items
                     for (size_t k = (size_t)tune_index; k < this->m_items.size(); ++k)
                         static_cast<ButtonListItem*>(this->m_items[k])->setEntryNumber(
                             static_cast<u32>(k + 1));
-
+                
+                    this->m_list->setFocusedIndex(nextIndex);
+                
                     notifyCountChanged(m_on_count_changed);
                     triggerMoveFeedback();
                 }

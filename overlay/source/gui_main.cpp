@@ -369,7 +369,7 @@ tsl::elm::Element* SettingsGui::createUI() {
     m_list->addItem(browser_button);
 
     // ---- Volume ----
-    m_list->addItem(new tsl::elm::CategoryHeader("Volume "+ult::DIVIDER_SYMBOL+" \uE0E3 Toggle Mute"));
+    m_list->addItem(new tsl::elm::CategoryHeader("Volume "+ult::DIVIDER_SYMBOL+"  Toggle Mute"));
 
     float tune_volume = 1.f, title_volume = 1.f, default_title_volume = 1.f;
     tuneGetVolume(&tune_volume);
