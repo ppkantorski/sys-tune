@@ -250,6 +250,24 @@ namespace tune::impl {
         bool g_should_pause      = false;
         bool g_should_run        = true;
 
+        /* Event-based wake-ups — replace sleep-polling in two hot paths:
+         *
+         *   g_unpause_event       — signaled whenever g_should_pause may have
+         *                           become false, g_status changed to FetchNext,
+         *                           or the sysmodule is shutting down.  Allows
+         *                           PlayTrack's pause loop to block indefinitely
+         *                           instead of waking every 50 ms.
+         *
+         *   g_queue_changed_event — signaled by Enqueue() when a track is added.
+         *                           Allows TuneThreadFunc's empty-queue loop to
+         *                           block indefinitely instead of waking every
+         *                           100 ms.
+         *
+         * Both are auto-clear (one-shot): the signal is consumed on the first
+         * waiter wake-up, preventing stale signals from stacking up. */
+        LEvent g_unpause_event;
+        LEvent g_queue_changed_event;
+
         /* --------------------------------------------------------------
          * User-action tracking for the pause/play policy engine.
          *
@@ -402,7 +420,11 @@ namespace tune::impl {
 
             while (g_should_run && g_status == PlayerStatus::Playing) {
                 if (g_should_pause) {
-                    svcSleepThread(50'000'000);
+                    // Block until Play/Next/Select/policy signals us, or 500 ms safety timeout.
+                    // leventClear resets the signal state so the next wait actually blocks
+                    // rather than returning immediately (LEvent is manual-clear by default).
+                    leventWait(&g_unpause_event, 500'000'000ULL);
+                    leventClear(&g_unpause_event);
                     continue;
                 }
 
@@ -520,6 +542,8 @@ namespace tune::impl {
             g_pdmqry_available = false;
         }
         g_should_run = false;
+        leventSignal(&g_unpause_event);       // unblock PlayTrack's pause wait
+        leventSignal(&g_queue_changed_event); // unblock TuneThreadFunc's empty-queue wait
     }
 
     void TuneThreadFunc(void *) {
@@ -593,9 +617,11 @@ namespace tune::impl {
                 }
             }
 
-            /* Sleep if queue is empty. */
+            /* Block until Enqueue() adds something — no reason to wake
+             * periodically when the queue is genuinely empty. */
             if (!g_current.IsValid()) {
-                svcSleepThread(100'000'000ul);
+                leventWait(&g_queue_changed_event, 500'000'000ULL);
+                leventClear(&g_queue_changed_event);
                 continue;
             }
 
@@ -641,7 +667,9 @@ namespace tune::impl {
                 }
                 old_value = value;
             }
-            svcSleepThread(10'000'000);
+            // 100 ms is imperceptibly fast for headphone-jack detection and cuts
+            // wakeups from 100/sec to 10/sec compared to the old 10 ms poll.
+            svcSleepThread(100'000'000);
         }
     }
 
@@ -736,20 +764,68 @@ namespace tune::impl {
             if (!should_pause && g_user_paused)
                 return;  // veto: user's Pause outranks this unpause
             g_should_pause = should_pause;
+            if (!should_pause)
+                leventSignal(&g_unpause_event); // wake PlayTrack's pause wait
         };
 
         /* Shared fade helpers — used by both the title-change path and the
          * HOME focus-flip path so the behaviour is identical in all cases. */
-        auto fadeOut = [&](int steps = kFadeSteps, u64 interval_ns = kFadeStepIntervalNs) {
+        auto fadeOut = [&](int steps = kFadeSteps, u64 interval_ns = kFadeStepIntervalNs, bool interruptible = false, u64 tid_for_interrupt = 0) {
             if (g_should_pause) {
                 policyWrite(true);
                 return;
             }
             float vol = GetVolume();
+            int fade_stopped_at = -1; // >=0 when interrupted mid-fade by a focus-loss event
             for (int i = steps - 1; i >= 0 && g_should_run; --i) {
                 audoutSetAudioOutVolume(vol * (static_cast<float>(i) / steps));
                 svcSleepThread(interval_ns);
+                /* Mid-fade HOME detection (title-change fadeOut only).
+                 *
+                 * When the user launches a game with "Pause On Start" and
+                 * immediately presses HOME, PmdmntThreadFunc is blocked inside
+                 * this loop for up to kFadeSteps * interval_ns (~1 s).
+                 * Section (2)'s focus-poll can't run until we return.
+                 *
+                 * By checking pdmqry on every step we detect the HOME press
+                 * in-flight and abort, then reverse the fade back up from the
+                 * current level so music keeps playing.  Section (2) handles
+                 * the focus-flip event normally (ForcePlay → fadeIn fast-path,
+                 * etc.) without fighting a silenced, paused playback state.
+                 *
+                 * This check is intentionally OFF for section (2)'s
+                 * HOME-press / HOME-return fadeOuts: at those call sites the
+                 * game is already out of focus, so the check would fire on the
+                 * very first iteration and abort a fade that should run.
+                 *
+                 * Note: tid_for_interrupt is passed explicitly rather than
+                 * captured, because this lambda is defined before current_tid
+                 * is declared in PmdmntThreadFunc's scope. */
+                if (interruptible && g_pdmqry_available
+                        && tid_for_interrupt != 0
+                        && tid_for_interrupt != kHomeScreenTid) {
+                    bool out = false;
+                    if (R_SUCCEEDED(isApplicationOutOfFocus(tid_for_interrupt, &out)) && out) {
+                        fade_stopped_at = i;
+                        break;
+                    }
+                }
             }
+
+            if (fade_stopped_at >= 0) {
+                /* Interrupted — reverse the fade back up from the step we
+                 * stopped at so playback resumes smoothly at full volume.
+                 * Do NOT call policyWrite(true): music was never paused.
+                 * Section (2) will handle the HOME focus-flip policy
+                 * (ForcePlay / ForcePause / DoNothing) on the very next tick. */
+                for (int i = fade_stopped_at; i <= steps && g_should_run; ++i) {
+                    audoutSetAudioOutVolume(vol * (static_cast<float>(i) / steps));
+                    svcSleepThread(interval_ns);
+                }
+                audoutSetAudioOutVolume(vol);
+                return;
+            }
+
             policyWrite(true);
             svcSleepThread(3ULL * AUDIO_LATENCY_MS * 1'000'000ULL);
             audoutSetAudioOutVolume(vol); // restore after drain
@@ -776,6 +852,10 @@ namespace tune::impl {
         bool last_focused    = true;  // focus state observed last tick
         bool s_vol_needs_reapply  = false; // set on focus-loss AND focus-return; triggers vol write
         bool s_in_vol_transition  = false; // true during tight-poll window after focus flip; drives 1 ms sleep
+        // Hoisted from inside if(current_pid) so the adaptive sleep expression
+        // at the bottom of the loop can read them without scope issues.
+        int  s_retry_ticks      = 0;
+        int  s_transition_ticks = 0;
 
         /* Immediately write sys-tune's per-title master volume to the
          * foreground game process.  Called at the TOP of each focus
@@ -862,6 +942,28 @@ namespace tune::impl {
                          *
                          * For every other title, apply Play/Pause On Start. */
                         if (new_tid != kHomeScreenTid) {
+                            /* Commit current_tid and last_focused BEFORE the
+                             * fade so that:
+                             *
+                             *  (a) The interruptible fadeOut's mid-loop
+                             *      isApplicationOutOfFocus() call uses the
+                             *      correct (new) game TID, not a stale one.
+                             *      We pass new_tid explicitly as
+                             *      tid_for_interrupt because the lambda is
+                             *      defined before current_tid is in scope.
+                             *
+                             *  (b) kHomeScreenTid can never reach these
+                             *      assignments.  Without this guard a pmdmnt
+                             *      event for HOME queued while fadeOut blocks
+                             *      is consumed on the next PollCurrentPidTid
+                             *      call, overwriting current_tid with
+                             *      kHomeScreenTid.  Section (2) then calls
+                             *      isApplicationOutOfFocus(HOME) which always
+                             *      fails, so the game's focus events are never
+                             *      observed and Play/Pause-on-Home never fires. */
+                            current_tid  = new_tid;
+                            last_focused = true;   // new foreground starts focused
+
                             const auto action = resolvePerTitlePolicy(new_tid);
                             if (action == StartAction::ForcePlay) {
                                 /* The user explicitly configured this title to
@@ -870,13 +972,22 @@ namespace tune::impl {
                                 g_user_paused = false;
                                 fadeIn();
                             } else if (action == StartAction::ForcePause) {
-                                fadeOut();
+                                /* interruptible=true + tid_for_interrupt=new_tid:
+                                 * if the user presses HOME while the fade is in
+                                 * progress the loop aborts and reverses, letting
+                                 * section (2) handle the focus-flip correctly
+                                 * rather than delivering a stale paused state
+                                 * after the full ~1 s fade. */
+                                fadeOut(kFadeSteps, kFadeStepIntervalNs,
+                                        /*interruptible=*/true, /*tid_for_interrupt=*/new_tid);
                             }
                             /* DoNothing: leave g_should_pause as-is. */
                         }
-
-                        current_tid  = new_tid;
-                        last_focused = true;   // new foreground starts focused
+                        /* kHomeScreenTid: current_pid was already updated above.
+                         * Do NOT touch current_tid or last_focused — section (2)
+                         * must keep querying the game's TID so the HOME
+                         * out-of-focus event is detected and Play/Pause-on-Home
+                         * fires correctly. */
                     }
                 }
             }
@@ -1006,9 +1117,8 @@ namespace tune::impl {
                 const auto v = g_use_title_volume ? g_title_volume : g_default_title_volume;
                 static u64   s_last_vol_pid     = 0;
                 static float s_last_vol         = -1.f;
-                static int   s_retry_ticks      = 0;   // fail-retry window after PID change
+                // s_retry_ticks and s_transition_ticks declared at function scope above.
                 static bool  s_applied_ok       = false;
-                static int   s_transition_ticks = 0;   // sustained write window after focus flip
 
                 if (current_pid != s_last_vol_pid) {
                     s_last_vol_pid     = current_pid;
@@ -1100,10 +1210,17 @@ namespace tune::impl {
                 }
             }
 
-            // Tight-poll during the focus-transition window (1 ms) so any
-            // post-resume audproc reset is caught and corrected within 1 ms.
-            // Outside that window use the normal 10 ms cadence.
-            svcSleepThread(s_in_vol_transition ? 1'000'000ULL : 10'000'000ULL);
+            // Three-tier sleep cadence:
+            //   1 ms  — tight post-focus-flip window: catch audproc resets within 1 ms
+            //  10 ms  — active write window (retry or sustained transition ticks)
+            //  50 ms  — true steady state: no transitions, no retries pending.
+            //            Title changes and HOME events are unaffected — they are
+            //            detected within 50 ms at most, which is imperceptible.
+            const u64 sleep_ns = s_in_vol_transition      ? 1'000'000ULL
+                               : (s_retry_ticks > 0 ||
+                                  s_transition_ticks > 0) ? 10'000'000ULL
+                                                          : 50'000'000ULL;
+            svcSleepThread(sleep_ns);
         }
     }
 
@@ -1115,6 +1232,7 @@ namespace tune::impl {
         g_should_pause       = false;
         g_user_paused        = false;  // clears the pause-veto
         g_saved_pause_state  = false;  // keep focus-suspend snapshot in sync
+        leventSignal(&g_unpause_event);
     }
 
     void Pause() {
@@ -1140,6 +1258,7 @@ namespace tune::impl {
         g_should_pause       = pause;
         g_user_paused        = pause;  // honour end-of-queue stop as an intentional pause
         g_saved_pause_state  = pause;
+        leventSignal(&g_unpause_event); // wake PlayTrack whether pausing or advancing
     }
 
     void Prev() {
@@ -1156,6 +1275,7 @@ namespace tune::impl {
         g_should_pause       = false;
         g_user_paused        = false;
         g_saved_pause_state  = false;
+        leventSignal(&g_unpause_event);
     }
 
     float GetVolume() {
@@ -1278,6 +1398,7 @@ namespace tune::impl {
             g_queue_position = 0;
         }
         g_status = PlayerStatus::FetchNext;
+        leventSignal(&g_unpause_event); // wake PlayTrack so it observes FetchNext
     }
 
     // currently unused (and untested).
@@ -1308,6 +1429,7 @@ namespace tune::impl {
         g_should_pause        = false;
         g_user_paused        = false;
         g_saved_pause_state  = false;
+        leventSignal(&g_unpause_event);
     }
 
     void Seek(u32 position) {
@@ -1328,6 +1450,9 @@ namespace tune::impl {
         if (!g_playlist.Add(buffer, type)) {
             return tune::OutOfMemory;
         }
+
+        // Wake TuneThreadFunc if it was blocked on an empty queue.
+        leventSignal(&g_queue_changed_event);
 
         // check if the current position still points to the same entry, update if not.
         if (g_current.IsValid() && g_current.id != g_playlist.Get(g_queue_position, g_shuffle).id) {
@@ -1358,6 +1483,9 @@ namespace tune::impl {
 
         if (fetch_new)
             g_status = PlayerStatus::FetchNext;
+
+        if (fetch_new)
+            leventSignal(&g_unpause_event); // wake PlayTrack so it observes FetchNext
 
         return 0;
     }
