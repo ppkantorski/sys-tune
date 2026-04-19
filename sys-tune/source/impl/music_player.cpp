@@ -243,6 +243,25 @@ namespace tune::impl {
         constexpr int  kFadeSteps           = 200;
         constexpr u64  kFadeStepIntervalNs  = 5'000'000ULL;
 
+        /* HOME-flag state machine tick counts (each tick = 5 ms main-loop sleep).
+         *
+         * kFirstFocusHoldTicks: silent-hold duration after a first-focus FadeOut
+         *     reaches silence.  Volume stays 0, music still plays.  Gives pdmqry's
+         *     slow NAND-backed OutOfFocus write time to arrive before the hold
+         *     expires and policyWrite(true) commits the pause.  600 × 5 ms = 3 s.
+         *
+         * kStaleGuardMaxTicks: safety-valve cap for the section (2.5) post-reversal
+         *     stale-guard.  The guard normally clears on the first real OutOfFocus;
+         *     this is the absolute upper bound in case pdmqry never delivers it.
+         *     200 × 5 ms = 1 s.
+         *
+         * kHomeFlagCheckIntervalTicks: throttle for section (2.5)'s periodic flag
+         *     re-read while a first-focus fade/hold is in progress.  20 × 5 ms =
+         *     100 ms — imperceptible latency without hammering the SD card. */
+        constexpr int  kFirstFocusHoldTicks        = 600;  // 3 s
+        constexpr int  kStaleGuardMaxTicks         = 200;  // 1 s
+        constexpr int  kHomeFlagCheckIntervalTicks = 20;   // 100 ms
+
         AudioOutBuffer g_audout_buffer[AUDIO_BUFFER_COUNT];
         alignas(0x1000) s16 AudioMemoryPool[AUDIO_BUFFER_COUNT][(AUDIO_BUFFER_SIZE + 0xFFF) & ~0xFFF];
         static_assert((sizeof(AudioMemoryPool[0]) % 0x2000) == 0, "Audio Memory pool needs to be page aligned!");
@@ -532,6 +551,26 @@ namespace tune::impl {
          * -------------------------------------------------------------- */
         g_should_pause = !config::get_auto_play_startup();
 
+        /* Delete any HOME flag left from a previous session.
+         *
+         * The ARM system counter resets on reboot.  A tick written in a previous
+         * boot could be numerically greater than fade_out_start_tick early in
+         * this boot, producing a false-positive HOME detection in section (2.5)
+         * that spuriously reverses the first fade.  Deleting the file here
+         * guarantees every flag read during this session was written this session,
+         * so tick comparisons are unambiguous.
+         *
+         * Use fsOpenSdCardFileSystem + fsFsDeleteFile rather than std::remove:
+         * std::remove suffers the same "sdmc:" devoptab issue as fopen — it
+         * silently no-ops on bare "/" paths in a sysmodule context. */
+        {
+            FsFileSystem sdFs;
+            if (R_SUCCEEDED(fsOpenSdCardFileSystem(&sdFs))) {
+                fsFsDeleteFile(&sdFs, "/config/ultrahand/flags/HOME_EVENT.flag");
+                fsFsClose(&sdFs);
+            }
+        }
+
         return 0;
 
     }
@@ -808,34 +847,63 @@ namespace tune::impl {
          * back up — no audible pause.  Only when the hold expires do we
          * call policyWrite(true) and start the normal drain.
          *
-         * This extends total coverage from (stability_window + fade) to
-         * (stability_window + fade + hold), giving pdmqry's slow NAND-
-         * backed OutOfFocus write enough time to arrive. */
+         * This extends total coverage from (fade) to (fade + hold),
+         * giving pdmqry's slow NAND-backed OutOfFocus write enough time
+         * to arrive. */
         int     fade_hold        = 0;   // remaining hold ticks
         int     fade_hold_target = 0;   // hold ticks to apply when FadeOut completes
 
-        /* Stability window for first-launch ForcePause.
+        /* Periodic HOME flag re-check during first-focus fade/hold.
          *
-         * Problem: pmdmnt fires and pdmqry logs InFocus as soon as the game
-         * registers with appletmgr (~100-500 ms after launch).  But when HOME
-         * is pressed during loading, pdmqry logs OutOfFocus with 1-2 s of
-         * additional latency (NAND write pressure during game loading).  If we
-         * call startFadeOut the moment InFocus arrives, the full 1 s fade runs
-         * to completion before OutOfFocus ever appears — leaving music stuck
-         * paused with no reversal.
+         * The was_first_focus checks at the ForcePause/ForcePlay decision
+         * points only run ONCE — at the moment InFocus fires.  If the user
+         * presses HOME AFTER that point (during the 1 s fade or 3 s hold),
+         * the flag file is updated but never re-read.  pdmqry's latency
+         * means OutOfFocus may not arrive until long after the transition
+         * is complete and the music is in the wrong state.
          *
-         * Solution: on the FIRST InFocus for a new TID with action=ForcePause,
-         * instead of fading immediately, run a 1000 ms polling window at 5 ms
-         * ticks.  Section (2) keeps running every tick.  If OutOfFocus arrives
-         * within the window, we know the user pressed HOME during loading —
-         * skip the fade and apply HOME policy.  If the window expires, the game
-         * is genuinely in focus and we start the fade (which remains
-         * interruptible by section (2) throughout its duration). */
-        int         fade_pending_ticks  = 0;
-        StartAction fade_pending_action = StartAction::DoNothing;
+         * fade_is_first_focus_out: armed when EITHER a first-focus
+         *     ForcePause FadeOut OR a first-focus ForcePlay FadeIn starts.
+         *     Name is historical — the mechanism is direction-agnostic.
+         *     Cleared when the fade/hold is cancelled, fully completes,
+         *     or when section (2.5) fires.
+         * fade_out_start_tick: armGetSystemTick() at that moment; used to
+         *     distinguish fresh HOME presses from stale ones written earlier.
+         * home_check_counter: throttle to one flag read per 20 ticks (100 ms). */
+        bool fade_is_first_focus_out  = false;
+        u64  fade_out_start_tick      = 0;
+        int  home_check_counter       = 0;
+        /* Tracks which HOME flag tick has already been consumed so a stale
+         * flag from a prior press (e.g. HOME pressed during normal gameplay,
+         * handled by section (2) or (2.5)) cannot suppress the first-focus
+         * fade on the NEXT game launch within the 20-second window. */
+        u64  last_consumed_home_tick  = 0;
+        /* armGetSystemTick() when the current TID was registered by pmdmnt.
+         * Used to precisely anchor the HOME detection window to this launch:
+         * any HOME press after this tick (or within a short pre-pmdmnt
+         * window) is treated as "pressed during loading". */
+        u64  tid_change_tick          = 0;
+        /* Set by section (2.5) after it reverses a first-focus FadeOut via
+         * the HOME flag file.  We also force last_focused = false there so
+         * section (2) can detect the eventual real game-return edge.  But
+         * pdmqry still reports InFocus for the game for several ticks (NAND
+         * log latency), so without this guard section (2) would see
+         * new_focused=true vs last_focused=false on the very next tick and
+         * fire a spurious "game return" → startFadeOut — immediately undoing
+         * the reversal we just did.
+         *
+         * While s25_stale_guard is set, section (2) skips InFocus ticks.
+         * It is cleared the moment pdmqry delivers a real OutOfFocus (guard
+         * period is over; subsequent InFocus ticks are genuine returns).
+         *
+         * s25_stale_counter counts consecutive stale-skipped ticks.  Safety
+         * valve: if 200 ticks (1 s) elapse without OutOfFocus, the guard is
+         * force-cleared so a genuine return is never blocked indefinitely. */
+        bool s25_stale_guard   = false;
+        int  s25_stale_counter = 0;
 
         auto fadeActive = [&]() -> bool {
-            return fade_dir != FadeDir::None || fade_drain > 0 || fade_pending_ticks > 0 || fade_hold > 0;
+            return fade_dir != FadeDir::None || fade_drain > 0 || fade_hold > 0;
         };
 
         /* startFadeOut: begin (or redirect to) a non-blocking fade-out.
@@ -960,8 +1028,29 @@ namespace tune::impl {
             policyWrite(false);
         };
 
-        bool first_poll   = true;
-        u64  current_tid  = 0;
+        /* Read the system tick written by the overlay HOME handler.
+         * Returns 0 if the file is absent or unreadable.
+         *
+         * IMPORTANT: use sdmc::OpenFile, NOT fopen.  In a sysmodule
+         * sdmc::Open() mounts the SD card as the "sdmc:" devoptab device;
+         * a bare "/" prefix silently returns null from fopen.
+         * sdmc::OpenFile uses the FsFileSystem handle directly and resolves
+         * "/" paths correctly — identical to every other file access here. */
+        auto readHomeFlagTick = []() -> u64 {
+            FsFile f;
+            if (R_FAILED(sdmc::OpenFile(&f, "/config/ultrahand/flags/HOME_EVENT.flag")))
+                return 0;
+            char buf[17] = {};
+            u64  n       = 0;
+            const Result rc = fsFileRead(&f, 0, buf, 16, FsReadOption_None, &n);
+            fsFileClose(&f);
+            if (R_FAILED(rc) || n == 0)
+                return 0;
+            return strtoull(buf, nullptr, 16);
+        };
+
+        bool first_poll      = true;
+        u64  current_tid     = 0;
         u64  current_pid     = 0;
         bool last_focused    = true;
         bool is_first_focus  = true;  // true after TID change; false after first InFocus fires
@@ -1086,18 +1175,20 @@ namespace tune::impl {
                              *       stays false → music keeps playing. ✓
                              *
                              * Cases (b) and (c) are the user-reported bug.
-                             * Section (0)'s home-button event handles them:
-                             * if InFocus arrives and a FadeOut starts, HOME
-                             * reverses it instantly via the hid:sys event.
-                             * If HOME fires before InFocus, last_focused is
-                             * still false so section (0) skips — no fade. */
-                            current_tid   = new_tid;
-                            last_focused  = false;   // neutral; section (2) will set true on InFocus
-                            is_first_focus = true;   // so section (2) uses full fade on first InFocus
-                            fade_pending_ticks  = 0; // cancel any pending fade from prior title
-                            fade_pending_action = StartAction::DoNothing;
-                            fade_hold        = 0;    // cancel any hold from prior title
-                            fade_hold_target = 0;
+                             * The HOME flag file covers them: if InFocus arrives
+                             * and a FadeOut starts, the was_first_focus check
+                             * (pre-fade) and the section (2.5) periodic monitor
+                             * (during-fade) together catch any HOME press and
+                             * reverse the fade via the flag tick comparison. */
+                            current_tid      = new_tid;
+                            tid_change_tick  = armGetSystemTick(); // anchor HOME detection to this launch
+                            last_focused     = false;   // neutral; section (2) will set true on InFocus
+                            is_first_focus   = true;    // so section (2) uses full fade on first InFocus
+                            fade_hold               = 0;    // cancel any hold from prior title
+                            fade_hold_target        = 0;
+                            fade_is_first_focus_out = false; // cancel any in-progress flag monitor
+                            s25_stale_guard         = false; // cancel stale-guard for new title
+                            s25_stale_counter       = 0;
                         } else {
                             /* HOME became the foreground process (game exited).
                              *
@@ -1128,7 +1219,17 @@ namespace tune::impl {
                                 if (last_focused) {
                                     /* (A) pdmqry missed the HOME press — apply HOME
                                      * policy now, same as section (2)'s !new_focused
-                                     * branch would have done. */
+                                     * branch would have done.
+                                     *
+                                     * Also consume the HOME flag tick.  pmdmnt fires
+                                     * kHomeScreenTid within a few ms of HOME press
+                                     * (much faster than pdmqry), so this handler is
+                                     * the primary detector during a title-launch fade.
+                                     * Without consuming the tick, the was_first_focus
+                                     * check on re-entry sees the same tick as "HOME
+                                     * pressed during loading" and skips the re-entry
+                                     * fade — leaving music audible through the game. */
+                                    last_consumed_home_tick = readHomeFlagTick();
                                     g_saved_pause_state = g_should_pause;
                                     const auto action = resolvePerTitlePolicy(kHomeScreenTid);
                                     if (action == StartAction::ForcePause) {
@@ -1157,10 +1258,11 @@ namespace tune::impl {
                                 current_tid    = 0;
                                 last_focused   = true;  // reset for next launch
                                 is_first_focus = true;  // next game gets full fade
-                                fade_pending_ticks  = 0; // game exited: cancel any pending fade
-                                fade_pending_action = StartAction::DoNothing;
-                                fade_hold        = 0;   // cancel any hold
-                                fade_hold_target = 0;
+                                fade_hold               = 0;   // cancel any hold
+                                fade_hold_target        = 0;
+                                fade_is_first_focus_out = false; // cancel flag monitor
+                                s25_stale_guard         = false; // cancel stale-guard
+                                s25_stale_counter       = 0;
                             }
                         }
                     }
@@ -1173,7 +1275,39 @@ namespace tune::impl {
                 const Result rc = isApplicationOutOfFocus(current_tid, &out);
                 if (R_SUCCEEDED(rc)) {
                     const bool new_focused = !out;
-                    if (new_focused != last_focused) {
+
+                    /* Stale-guard: section (2.5) set last_focused=false but
+                     * pdmqry still reports InFocus (NAND log latency).
+                     * Skip spurious InFocus ticks — only a real OutOfFocus
+                     * clears the guard so the subsequent genuine re-entry
+                     * fires the transition correctly.
+                     *
+                     * stale_skip=true suppresses the transition block for
+                     * this tick without modifying last_focused, preserving
+                     * the edge for when pdmqry actually catches up. */
+                    bool stale_skip = false;
+                    if (s25_stale_guard) {
+                        if (new_focused) {
+                            /* pdmqry still shows InFocus — stale. */
+                            if (++s25_stale_counter < kStaleGuardMaxTicks) {
+                                stale_skip = true;
+                            } else {
+                                /* Safety valve: 1 s elapsed without OutOfFocus.
+                                 * Force-clear and treat the next InFocus as real. */
+                                s25_stale_guard   = false;
+                                s25_stale_counter = 0;
+                            }
+                        } else {
+                            /* OutOfFocus arrived — guard period is over.
+                             * last_focused is already false (set by 2.5) and
+                             * new_focused is false → no edge → no handler.
+                             * The next InFocus will be a genuine return. */
+                            s25_stale_guard   = false;
+                            s25_stale_counter = 0;
+                        }
+                    }
+
+                    if (!stale_skip && new_focused != last_focused) {
                         if (!new_focused) {
                             /* Pressed HOME while in a game.
                              *
@@ -1202,10 +1336,12 @@ namespace tune::impl {
                              * non-blocking so section (2) ran freely, caught the
                              * OutOfFocus event, and is redirecting the ramp here. */
                             g_saved_pause_state = g_should_pause;
-                            /* Cancel any pending stability window — user is on
-                             * HOME regardless of what the window was waiting for. */
-                            fade_pending_ticks  = 0;
-                            fade_pending_action = StartAction::DoNothing;
+                            /* Mark the current HOME flag tick as consumed.
+                             * pdmqry delivered OutOfFocus so this HOME press
+                             * is handled; prevent the was_first_focus check on
+                             * the next launch from treating the same tick as a
+                             * fresh "pressed during loading" signal. */
+                            last_consumed_home_tick = readHomeFlagTick();
                             const auto action = resolvePerTitlePolicy(kHomeScreenTid);
                             if (action == StartAction::ForcePause) {
                                 if (fade_dir == FadeDir::Out) {
@@ -1256,23 +1392,125 @@ namespace tune::impl {
 
                             const auto action = resolvePerTitlePolicy(current_tid);
                             if (action == StartAction::ForcePlay) {
-                                g_user_paused = false;
-                                startFadeIn(fade_steps);
+                                if (was_first_focus) {
+                                    /* FIRST InFocus for this title with ForcePlay.
+                                     *
+                                     * Symmetric to the ForcePause first-focus path below:
+                                     * check the HOME flag BEFORE starting the FadeIn.
+                                     * If HOME was pressed during loading, skip the
+                                     * FadeIn entirely — music stays in whatever state
+                                     * it was on HOME, and pdmqry's eventual OutOfFocus
+                                     * (or section (2)'s normal HOME policy on the next
+                                     * edge) will drive the correct state.
+                                     *
+                                     * Same tick-anchoring logic as ForcePause; see
+                                     * the detailed rationale in that branch below. */
+                                    const u64 home_tick = readHomeFlagTick();
+                                    const u64 kPrePmdmntWindowTicks = armNsToTicks(2'000'000'000ULL); // 2 s
+                                    const bool home_pressed_during_load =
+                                        home_tick != 0 &&
+                                        home_tick != last_consumed_home_tick &&
+                                        home_tick > tid_change_tick - kPrePmdmntWindowTicks;
+                                    if (!home_pressed_during_load) {
+                                        g_user_paused = false;
+                                        startFadeIn(fade_steps);
+                                        /* Arm section (2.5) to catch HOME pressed DURING
+                                         * the FadeIn.  The variable is named *_out for
+                                         * historical reasons but now covers both fade
+                                         * directions — section (2.5) dispatches on the
+                                         * actual fade_dir when it fires. */
+                                        fade_out_start_tick     = armGetSystemTick();
+                                        fade_is_first_focus_out = true;
+                                        home_check_counter      = 0;
+                                    } else {
+                                        /* HOME was pressed during loading — skip the FadeIn.
+                                         * Consume the tick so re-entry within the window
+                                         * doesn't incorrectly suppress the next first-focus. */
+                                        last_consumed_home_tick = home_tick;
+                                    }
+                                } else {
+                                    /* HOME return with ForcePlay: just fade back in. */
+                                    g_user_paused = false;
+                                    startFadeIn(fade_steps);
+                                }
                             } else if (action == StartAction::ForcePause) {
                                 if (was_first_focus) {
                                     /* FIRST InFocus for this title with ForcePause.
                                      *
-                                     * Start the fade immediately (no stability window)
-                                     * with a 1500 ms silent hold after it (hold_ticks=300).
-                                     * After the 1 s fade reaches silence, policyWrite(true)
-                                     * is deferred: volume stays 0, music still playing.
-                                     * kHomeScreenTid fires the instant HOME is pressed via
-                                     * pmdmnt — no pdmqry latency involved — so it handles
-                                     * HOME reliably at any point during the fade or hold.
-                                     * The hold just provides extra coverage for the rare case
-                                     * where pmdmnt fires kHomeScreenTid after the fade is
-                                     * already complete (e.g. very slow game loading). */
-                                    startFadeOut(fade_steps, /*do_pause=*/true, /*hold_ticks=*/600);
+                                     * Before starting the fade, check whether HOME was
+                                     * pressed during loading.  The overlay writes the
+                                     * current armGetSystemTick() to a flag file whenever
+                                     * HOME is pressed.  If that tick is newer than the
+                                     * tick we recorded when this TID was first seen, the
+                                     * user already navigated away — skip the fade so music
+                                     * keeps playing uninterrupted.
+                                     *
+                                     * If the flag is absent or too old, the user is genuinely
+                                     * in the game: start the fade with a silent hold so pdmqry
+                                     * still has time to reverse it if a late OutOfFocus arrives. */
+                                    const u64 home_tick = readHomeFlagTick();
+                                    /* Single-anchor check, relative to tid_change_tick:
+                                     *
+                                     *   home_tick > tid_change_tick - kPrePmdmntWindowTicks
+                                     *
+                                     * This covers both sub-cases with one comparison:
+                                     *
+                                     *   HOME pressed AFTER pmdmnt registered the game:
+                                     *     home_tick > tid_change_tick > tid_change_tick - window
+                                     *     → always true.  Precise, no false positives.
+                                     *
+                                     *   HOME pressed up to 2 s BEFORE pmdmnt registered:
+                                     *     home_tick in (tid_change_tick - 2 s, tid_change_tick]
+                                     *     → true.  Covers the "pressed HOME on the black loading
+                                     *     screen before the game process was even visible to pmdmnt".
+                                     *
+                                     *   HOME pressed more than 2 s before pmdmnt:
+                                     *     home_tick <= tid_change_tick - 2 s → false.
+                                     *     Treats it as a normal prior press — no suppression.
+                                     *
+                                     * Anchoring to tid_change_tick (not now/InFocus time) is
+                                     * critical: for slow-loading games InFocus can arrive
+                                     * several seconds after pmdmnt, so a "now - home_tick"
+                                     * window would need to be very large and would risk
+                                     * suppressing fades on legitimate re-entries.
+                                     *
+                                     * last_consumed_home_tick guards re-entry: a tick already
+                                     * handled by a previous section is excluded. */
+                                    /* Window expressed in nanoseconds and converted to ticks
+                                     * via armNsToTicks.  The ARM system timer (CNTPCT_EL0)
+                                     * runs at a fixed 19.2 MHz hardware oscillator — it is
+                                     * NOT on the CPU clock domain, so sys-clk / overclocking
+                                     * does not affect any tick readings here.  armNsToTicks
+                                     * hardcodes the same 19.2 MHz factor ((ns * 12) / 625),
+                                     * so this is purely a readability improvement over the
+                                     * raw `2ULL * 19'200'000ULL` form.
+                                     *
+                                     * `const` (not `constexpr`): armNsToTicks is declared
+                                     * `static inline` in libnx, not NX_CONSTEXPR, so it
+                                     * cannot appear in a constexpr initializer.  The call
+                                     * still folds to a compile-time constant under any
+                                     * optimizer — no runtime cost. */
+                                    const u64 kPrePmdmntWindowTicks = armNsToTicks(2'000'000'000ULL); // 2 s
+                                    const bool home_pressed_during_load =
+                                        home_tick != 0 &&
+                                        home_tick != last_consumed_home_tick &&
+                                        home_tick > tid_change_tick - kPrePmdmntWindowTicks;
+                                    if (!home_pressed_during_load) {
+                                        startFadeOut(fade_steps, /*do_pause=*/true, /*hold_ticks=*/kFirstFocusHoldTicks);
+                                        /* Arm section (2.5) to catch HOME pressed DURING the
+                                         * fade or hold (pdmqry latency path). */
+                                        fade_out_start_tick     = armGetSystemTick();
+                                        fade_is_first_focus_out = true;
+                                        home_check_counter      = 0;
+                                    } else {
+                                        /* HOME was pressed during loading — skip the fade.
+                                         * Mark the tick consumed so re-entering the same game
+                                         * within the window doesn't skip the next first-focus
+                                         * fade too. */
+                                        last_consumed_home_tick = home_tick;
+                                    }
+                                    /* Either path: pdmqry OutOfFocus (or section (2.5))
+                                     * handles all subsequent transitions correctly. */
                                 } else {
                                     /* HOME return → ForcePause: start immediately
                                      * (game is already fully loaded, no hold needed). */
@@ -1291,6 +1529,86 @@ namespace tune::impl {
                 }
                 /* else: current_tid isn't a tracked retail app (HOME
                  * itself, applet, etc.) — leave focus state untouched. */
+            }
+
+            /* ---- (2.5) Periodic HOME flag check during first-focus fade/hold ----
+             *
+             * The was_first_focus decision points only check the flag ONCE, at the
+             * moment InFocus fires.  If the user presses HOME AFTER that (i.e. during
+             * the 1 s fade or — for ForcePause — the subsequent 3 s silent hold),
+             * Ultrahand updates the flag but nobody reads it.  pdmqry's NAND-write
+             * latency means OutOfFocus can arrive long after the transition is
+             * complete and the music is in the wrong state with no recovery path.
+             *
+             * While fade_is_first_focus_out is set (armed by EITHER a first-focus
+             * ForcePause FadeOut OR a first-focus ForcePlay FadeIn — the name is
+             * historical, not directional), re-read the flag every 20 ticks (100 ms).
+             * If the flag tick is newer than fade_out_start_tick AND has not already
+             * been consumed elsewhere, HOME was pressed AFTER this fade started —
+             * apply HOME policy exactly as section (2) would have done if pdmqry
+             * had delivered OutOfFocus in time. */
+            if (fade_is_first_focus_out) {
+                if (fade_dir == FadeDir::None && fade_hold == 0) {
+                    /* Fade and hold both fully done (or cancelled) — stop monitoring.
+                     * Note: previously checked `fade_dir != FadeDir::Out` which also
+                     * stopped on FadeIn, but that broke the symmetric first-focus
+                     * ForcePlay path (FadeIn needs monitoring too).  The double-fire
+                     * risk that the old condition incidentally prevented is now
+                     * handled explicitly by the last_consumed_home_tick check below.
+                     * If fade_drain is still running that's fine; we can't reverse
+                     * at that point anyway (policyWrite(true) already fired). */
+                    fade_is_first_focus_out = false;
+                } else if (++home_check_counter >= kHomeFlagCheckIntervalTicks) {
+                    home_check_counter = 0;
+                    const u64 home_tick = readHomeFlagTick();
+                    /* last_consumed_home_tick guard: if section (2) or the
+                     * kHomeScreenTid handler already handled this HOME press
+                     * (e.g. pdmqry delivered OutOfFocus before our 100 ms
+                     * re-check), the tick is already consumed and we must
+                     * NOT fire again — doing so would re-apply HOME policy
+                     * and spuriously re-arm the stale-guard. */
+                    if (home_tick != 0
+                            && home_tick != last_consumed_home_tick
+                            && home_tick > fade_out_start_tick) {
+                        /* HOME was pressed during the fade/hold. */
+                        fade_is_first_focus_out = false;
+                        last_consumed_home_tick = home_tick;  // consumed — don't re-use on next launch
+                        g_saved_pause_state  = g_should_pause;
+                        const auto action    = resolvePerTitlePolicy(kHomeScreenTid);
+                        if (action == StartAction::ForcePause) {
+                            /* HOME also wants to pause: let the fade/hold finish
+                             * but strip any remaining hold so it pauses immediately. */
+                            if (fade_dir == FadeDir::Out) {
+                                fade_pause       = true;
+                                fade_hold_target = 0;
+                            } else {
+                                startFadeOut(kFadeSteps / 2, /*do_pause=*/true);
+                            }
+                        } else if (action == StartAction::ForcePlay) {
+                            g_user_paused = false;
+                            startFadeIn(kFadeSteps / 2);
+                        } else {
+                            /* DoNothing: reverse any in-progress fade or hold. */
+                            if (fade_dir == FadeDir::Out || fade_hold > 0)
+                                startFadeIn(kFadeSteps / 2);
+                        }
+                        /* Reflect real state: user is on HOME, not in the game.
+                         *
+                         * Setting last_focused=false here is necessary so that
+                         * section (2) can later detect the genuine "user returned
+                         * to game" edge (true vs false).  Without this, last_focused
+                         * stays true forever and re-entry never triggers ForcePause.
+                         *
+                         * The s25_stale_guard prevents the immediate spurious
+                         * "game return" that would otherwise fire on the very next
+                         * tick because pdmqry still shows InFocus (log latency).
+                         * Section (2) skips InFocus ticks while the guard is set,
+                         * and clears it the moment pdmqry delivers OutOfFocus. */
+                        last_focused      = false;
+                        s25_stale_guard   = true;
+                        s25_stale_counter = 0;
+                    }
+                }
             }
 
             /* ---- (3) Apply per-title master volume on legitimate events only ----
@@ -1409,20 +1727,6 @@ namespace tune::impl {
                     }
                 } else {
                     s_watchdog_ticks = 0;   // reset counter during active write windows
-                }
-            }
-
-            /* ---- Advance pending stability window ---- */
-            if (fade_pending_ticks > 0) {
-                if (--fade_pending_ticks == 0) {
-                    /* Window expired without OutOfFocus — game is genuinely
-                     * in focus.  Start the deferred fade now.  Section (2)
-                     * continues to run every 5 ms and can still reverse it
-                     * if the user presses HOME after the game has loaded. */
-                    if (fade_pending_action == StartAction::ForcePause) {
-                        startFadeOut(kFadeSteps, /*do_pause=*/true, /*hold_ticks=*/600);
-                    }
-                    fade_pending_action = StartAction::DoNothing;
                 }
             }
 
