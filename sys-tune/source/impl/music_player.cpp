@@ -768,88 +768,203 @@ namespace tune::impl {
                 leventSignal(&g_unpause_event); // wake PlayTrack's pause wait
         };
 
-        /* Shared fade helpers — used by both the title-change path and the
-         * HOME focus-flip path so the behaviour is identical in all cases. */
-        auto fadeOut = [&](int steps = kFadeSteps, u64 interval_ns = kFadeStepIntervalNs, bool interruptible = false, u64 tid_for_interrupt = 0) {
-            if (g_should_pause) {
-                policyWrite(true);
-                return;
-            }
-            float vol = GetVolume();
-            int fade_stopped_at = -1; // >=0 when interrupted mid-fade by a focus-loss event
-            for (int i = steps - 1; i >= 0 && g_should_run; --i) {
-                audoutSetAudioOutVolume(vol * (static_cast<float>(i) / steps));
-                svcSleepThread(interval_ns);
-                /* Mid-fade HOME detection (title-change fadeOut only).
-                 *
-                 * When the user launches a game with "Pause On Start" and
-                 * immediately presses HOME, PmdmntThreadFunc is blocked inside
-                 * this loop for up to kFadeSteps * interval_ns (~1 s).
-                 * Section (2)'s focus-poll can't run until we return.
-                 *
-                 * By checking pdmqry on every step we detect the HOME press
-                 * in-flight and abort, then reverse the fade back up from the
-                 * current level so music keeps playing.  Section (2) handles
-                 * the focus-flip event normally (ForcePlay → fadeIn fast-path,
-                 * etc.) without fighting a silenced, paused playback state.
-                 *
-                 * This check is intentionally OFF for section (2)'s
-                 * HOME-press / HOME-return fadeOuts: at those call sites the
-                 * game is already out of focus, so the check would fire on the
-                 * very first iteration and abort a fade that should run.
-                 *
-                 * Note: tid_for_interrupt is passed explicitly rather than
-                 * captured, because this lambda is defined before current_tid
-                 * is declared in PmdmntThreadFunc's scope. */
-                if (interruptible && g_pdmqry_available
-                        && tid_for_interrupt != 0
-                        && tid_for_interrupt != kHomeScreenTid) {
-                    bool out = false;
-                    if (R_SUCCEEDED(isApplicationOutOfFocus(tid_for_interrupt, &out)) && out) {
-                        fade_stopped_at = i;
-                        break;
-                    }
-                }
-            }
+        /* ---------------------------------------------------------------
+         * Non-blocking fade state machine.
+         *
+         * The old blocking fadeOut/fadeIn lambdas owned PmdmntThreadFunc's
+         * thread for up to 1 s per call.  During that time section (2)'s
+         * pdmqry poll could never run, so a HOME press mid-fade was
+         * invisible until the fade completed — leaving music stuck paused.
+         *
+         * The new design advances the fade by ONE STEP per main-loop tick
+         * at the bottom of the loop.  Section (2) runs every 5 ms during
+         * any active fade and can redirect it (e.g. FadeOut → FadeIn) on
+         * the very tick pdmqry posts an OutOfFocus event.
+         *
+         * FadeDir::Out  — volume decreases each tick (fade_step counts down)
+         * FadeDir::In   — volume increases each tick (fade_step counts up)
+         *
+         * fade_pause: when true, call policyWrite(true) and start a short
+         *             drain countdown when FadeOut reaches silence.
+         * fade_drain: ticks remaining for audio-buffer drain after pause;
+         *             volume stays at 0 until the counter expires, then
+         *             restores to fade_vol to avoid a pop on next play.
+         * --------------------------------------------------------------- */
+        enum class FadeDir { None, Out, In };
+        FadeDir fade_dir   = FadeDir::None;
+        int     fade_step  = 0;     // current step (Out: counts down; In: counts up)
+        int     fade_total = 0;     // total steps
+        float   fade_vol   = 0.f;   // master volume captured at fade start
+        bool    fade_pause = false; // call policyWrite(true) when FadeOut ends
+        int     fade_drain = 0;     // ticks to hold silence after fadeOut+pause
 
-            if (fade_stopped_at >= 0) {
-                /* Interrupted — reverse the fade back up from the step we
-                 * stopped at so playback resumes smoothly at full volume.
-                 * Do NOT call policyWrite(true): music was never paused.
-                 * Section (2) will handle the HOME focus-flip policy
-                 * (ForcePlay / ForcePause / DoNothing) on the very next tick. */
-                for (int i = fade_stopped_at; i <= steps && g_should_run; ++i) {
-                    audoutSetAudioOutVolume(vol * (static_cast<float>(i) / steps));
-                    svcSleepThread(interval_ns);
-                }
-                audoutSetAudioOutVolume(vol);
-                return;
-            }
+        /* Silent-hold phase (first-launch ForcePause only).
+         *
+         * After a first-launch FadeOut reaches silence, we do NOT
+         * immediately call policyWrite(true).  Instead we enter a hold
+         * for fade_hold_target ticks (volume stays 0, music still plays).
+         * Section (2) keeps running at 5 ms; if pdmqry delivers
+         * OutOfFocus during the hold, startFadeIn cancels it and ramps
+         * back up — no audible pause.  Only when the hold expires do we
+         * call policyWrite(true) and start the normal drain.
+         *
+         * This extends total coverage from (stability_window + fade) to
+         * (stability_window + fade + hold), giving pdmqry's slow NAND-
+         * backed OutOfFocus write enough time to arrive. */
+        int     fade_hold        = 0;   // remaining hold ticks
+        int     fade_hold_target = 0;   // hold ticks to apply when FadeOut completes
 
-            policyWrite(true);
-            svcSleepThread(3ULL * AUDIO_LATENCY_MS * 1'000'000ULL);
-            audoutSetAudioOutVolume(vol); // restore after drain
+        /* Stability window for first-launch ForcePause.
+         *
+         * Problem: pmdmnt fires and pdmqry logs InFocus as soon as the game
+         * registers with appletmgr (~100-500 ms after launch).  But when HOME
+         * is pressed during loading, pdmqry logs OutOfFocus with 1-2 s of
+         * additional latency (NAND write pressure during game loading).  If we
+         * call startFadeOut the moment InFocus arrives, the full 1 s fade runs
+         * to completion before OutOfFocus ever appears — leaving music stuck
+         * paused with no reversal.
+         *
+         * Solution: on the FIRST InFocus for a new TID with action=ForcePause,
+         * instead of fading immediately, run a 1000 ms polling window at 5 ms
+         * ticks.  Section (2) keeps running every tick.  If OutOfFocus arrives
+         * within the window, we know the user pressed HOME during loading —
+         * skip the fade and apply HOME policy.  If the window expires, the game
+         * is genuinely in focus and we start the fade (which remains
+         * interruptible by section (2) throughout its duration). */
+        int         fade_pending_ticks  = 0;
+        StartAction fade_pending_action = StartAction::DoNothing;
+
+        auto fadeActive = [&]() -> bool {
+            return fade_dir != FadeDir::None || fade_drain > 0 || fade_pending_ticks > 0 || fade_hold > 0;
         };
 
-        auto fadeIn = [&](int steps = kFadeSteps, u64 interval_ns = kFadeStepIntervalNs) {
+        /* startFadeOut: begin (or redirect to) a non-blocking fade-out.
+         *
+         *   - If a FadeIn is in progress, reverse it from the current
+         *     position (proportionally mapped to `steps`).
+         *   - If already paused, call policyWrite(true) and return.
+         *   - Otherwise capture the current volume and start the ramp. */
+        auto startFadeOut = [&](int steps, bool do_pause, int hold_ticks = 0) {
+            if (fade_dir == FadeDir::In) {
+                /* Reverse FadeIn → FadeOut from current position. */
+                int out_step   = int(float(fade_step) / float(fade_total) * float(steps));
+                fade_dir         = FadeDir::Out;
+                fade_step        = out_step;
+                fade_total       = steps;
+                fade_pause       = do_pause;
+                fade_drain       = 0;
+                fade_hold_target = do_pause ? hold_ticks : 0;
+                return;
+            }
+            if (fade_hold > 0) {
+                /* Already in the silent-hold phase (volume=0, still playing).
+                 * There is nothing left to fade out — just commit the pause. */
+                fade_hold        = 0;
+                fade_hold_target = 0;
+                if (do_pause) {
+                    policyWrite(true);
+                    fade_drain = (3 * AUDIO_LATENCY_MS + 4) / 5;
+                }
+                return;
+            }
+            if (fade_drain > 0) {
+                /* Cancel drain and restore volume before starting new fade. */
+                fade_drain = 0;
+                audoutSetAudioOutVolume(fade_vol);
+            }
+            if (g_should_pause) {
+                if (do_pause) policyWrite(true);
+                return;
+            }
+            fade_vol         = GetVolume();
+            fade_dir         = FadeDir::Out;
+            fade_step        = steps - 1;
+            fade_total       = steps;
+            fade_pause       = do_pause;
+            fade_drain       = 0;
+            fade_hold_target = do_pause ? hold_ticks : 0;
+        };
+
+        /* startFadeIn: begin (or redirect to) a non-blocking fade-in.
+         *
+         *   - If a FadeOut is in progress, REVERSE it from the current
+         *     position (proportionally mapped to `steps`).  This is the
+         *     key path for HOME-press interrupting a title-launch fade:
+         *     no blocking, no hidsys, purely driven by section (2)'s
+         *     pdmqry poll now running every 5 ms.
+         *   - If in a drain countdown, cancel it and fade in from silence.
+         *   - If music is already playing, ensure policyWrite(false). */
+        auto startFadeIn = [&](int steps) {
+            if (fade_dir == FadeDir::Out) {
+                /* Reverse FadeOut → FadeIn from current position.
+                 * g_should_pause is still false (FadeOut never set it),
+                 * so no policyWrite needed — just flip direction. */
+                int rev_step = int(float(fade_step) / float(fade_total) * float(steps));
+                fade_dir   = FadeDir::In;
+                fade_step  = rev_step;
+                fade_total = steps;
+                fade_pause = false;
+                fade_drain = 0;
+                return;
+            }
+            if (fade_hold > 0) {
+                /* Silent-hold phase: volume is already 0, music is still
+                 * playing (g_should_pause=false).  Cancel the hold and
+                 * ramp straight back up — no policyWrite needed. */
+                fade_hold        = 0;
+                fade_hold_target = 0;
+                fade_dir   = FadeDir::In;
+                fade_step  = 1;
+                fade_total = steps;
+                fade_pause = false;
+                fade_drain = 0;
+                return;
+            }
+            if (fade_drain > 0) {
+                /* Was draining after a FadeOut+pause.
+                 *
+                 * CRITICAL: do NOT call GetVolume() here.  audout was left
+                 * at 0.f when the FadeOut completed (the last advance step
+                 * wrote fade_vol * 0/total = 0), so GetVolume() would
+                 * return 0 and the subsequent FadeIn would silently ramp
+                 * 0 * (step/total) = 0 every tick — no audible fade-in.
+                 *
+                 * fade_vol was captured by startFadeOut before the ramp
+                 * began and has not changed; it is already the correct
+                 * pre-fade master volume.  Start the FadeIn directly from
+                 * the current silence (audout already at 0). */
+                fade_drain = 0;
+                fade_dir   = FadeDir::In;
+                fade_step  = 1;
+                fade_total = steps;
+                fade_pause = false;
+                /* g_should_pause=true was set by policyWrite() at the end
+                 * of the FadeOut; un-pause so audio can flow again. */
+                policyWrite(false);
+                return;
+            }
             if (!g_should_pause) {
                 policyWrite(false);
                 return;
             }
-            float target = GetVolume();
+            /* Standard path: paused but drain has already expired.
+             * audoutSetAudioOutVolume(fade_vol) ran when drain hit 0,
+             * so GetVolume() correctly returns the pre-fade level here. */
+            fade_vol   = GetVolume();
+            fade_dir   = FadeDir::In;
+            fade_step  = 1;
+            fade_total = steps;
+            fade_pause = false;
+            fade_drain = 0;
             audoutSetAudioOutVolume(0.f);
             policyWrite(false);
-            for (int i = 1; i <= steps && g_should_run; ++i) {
-                audoutSetAudioOutVolume(target * (static_cast<float>(i) / steps));
-                svcSleepThread(interval_ns);
-            }
-            audoutSetAudioOutVolume(target);
         };
 
         bool first_poll   = true;
-        u64  current_tid  = 0;     // tracks the foreground tid across ticks
-        u64  current_pid     = 0;     // tracks foreground pid for volume IPC
-        bool last_focused    = true;  // focus state observed last tick
+        u64  current_tid  = 0;
+        u64  current_pid     = 0;
+        bool last_focused    = true;
+        bool is_first_focus  = true;  // true after TID change; false after first InFocus fires
         bool s_vol_needs_reapply  = false; // set on focus-loss AND focus-return; triggers vol write
         bool s_in_vol_transition  = false; // true during tight-poll window after focus flip; drives 1 ms sleep
         // Hoisted from inside if(current_pid) so the adaptive sleep expression
@@ -942,52 +1057,112 @@ namespace tune::impl {
                          *
                          * For every other title, apply Play/Pause On Start. */
                         if (new_tid != kHomeScreenTid) {
-                            /* Commit current_tid and last_focused BEFORE the
-                             * fade so that:
+                            /* Register the new TID.  Do NOT apply any policy
+                             * here.  pmdmnt fires the instant PM creates the
+                             * game process, which is BEFORE the game connects
+                             * its applet session to appletmgr.  If the user
+                             * presses HOME in that window, pdmqry will have
+                             * zero events for this TID — so we cannot tell
+                             * whether the user is actually in the game yet.
                              *
-                             *  (a) The interruptible fadeOut's mid-loop
-                             *      isApplicationOutOfFocus() call uses the
-                             *      correct (new) game TID, not a stale one.
-                             *      We pass new_tid explicitly as
-                             *      tid_for_interrupt because the lambda is
-                             *      defined before current_tid is in scope.
+                             * Deferring to section (2) handles all three cases
+                             * cleanly:
                              *
-                             *  (b) kHomeScreenTid can never reach these
-                             *      assignments.  Without this guard a pmdmnt
-                             *      event for HOME queued while fadeOut blocks
-                             *      is consumed on the next PollCurrentPidTid
-                             *      call, overwriting current_tid with
-                             *      kHomeScreenTid.  Section (2) then calls
-                             *      isApplicationOutOfFocus(HOME) which always
-                             *      fails, so the game's focus events are never
-                             *      observed and Play/Pause-on-Home never fires. */
-                            current_tid  = new_tid;
-                            last_focused = true;   // new foreground starts focused
-
-                            const auto action = resolvePerTitlePolicy(new_tid);
-                            if (action == StartAction::ForcePlay) {
-                                /* The user explicitly configured this title to
-                                 * play — that IS their stated intent, so it
-                                 * overrides any prior manual pause veto. */
-                                g_user_paused = false;
-                                fadeIn();
-                            } else if (action == StartAction::ForcePause) {
-                                /* interruptible=true + tid_for_interrupt=new_tid:
-                                 * if the user presses HOME while the fade is in
-                                 * progress the loop aborts and reverses, letting
-                                 * section (2) handle the focus-flip correctly
-                                 * rather than delivering a stale paused state
-                                 * after the full ~1 s fade. */
-                                fadeOut(kFadeSteps, kFadeStepIntervalNs,
-                                        /*interruptible=*/true, /*tid_for_interrupt=*/new_tid);
+                             *   (a) pdmqry logs InFocus  → section (2) fires,
+                             *       applies title policy (ForcePause → fadeOut).
+                             *       The fade is interruptible: if HOME is pressed
+                             *       after registration, pdmqry logs OutOfFocus
+                             *       and the fade loop catches it.
+                             *
+                             *   (b) pdmqry logs OutOfFocus only (user pressed
+                             *       HOME after partial registration) → section (2)
+                             *       sees new_focused=false vs last_focused=false
+                             *       → no transition fires → music keeps playing.
+                             *       (section (2) only fires on edge changes.)
+                             *
+                             *   (c) pdmqry logs nothing at all (game suspended
+                             *       during loading before appletmgr handshake)
+                             *       → section (2) never fires → last_focused
+                             *       stays false → music keeps playing. ✓
+                             *
+                             * Cases (b) and (c) are the user-reported bug.
+                             * Section (0)'s home-button event handles them:
+                             * if InFocus arrives and a FadeOut starts, HOME
+                             * reverses it instantly via the hid:sys event.
+                             * If HOME fires before InFocus, last_focused is
+                             * still false so section (0) skips — no fade. */
+                            current_tid   = new_tid;
+                            last_focused  = false;   // neutral; section (2) will set true on InFocus
+                            is_first_focus = true;   // so section (2) uses full fade on first InFocus
+                            fade_pending_ticks  = 0; // cancel any pending fade from prior title
+                            fade_pending_action = StartAction::DoNothing;
+                            fade_hold        = 0;    // cancel any hold from prior title
+                            fade_hold_target = 0;
+                        } else {
+                            /* HOME became the foreground process (game exited).
+                             *
+                             * Two responsibilities:
+                             *
+                             * (A) ForcePlay/ForcePause fallback — if pdmqry never
+                             *     logged an OutOfFocus event for the game (race:
+                             *     game launched and HOME'd before appletmgr
+                             *     registered its applet session), last_focused
+                             *     is still true and section (2) never fired.
+                             *     Apply HOME policy now as guaranteed fallback.
+                             *     Guarded by last_focused so we don't double-fire
+                             *     when section (2) already handled the transition.
+                             *
+                             * (B) Stale-TID reset — unconditionally zero
+                             *     current_tid so section (2) stops querying the
+                             *     now-exited game's TID.  Without this, pdmqry's
+                             *     exit-sequence events (the game can briefly
+                             *     appear InFocus during teardown / close animation)
+                             *     look like a HOME-return transition: section (2)
+                             *     sees new_focused=true with last_focused=false
+                             *     (just set by this handler) and fires the
+                             *     HOME-return ForcePause — producing the audible
+                             *     "fade in for a second, then fade back out" the
+                             *     user observes when exiting a game. */
+                            if (!first_poll && current_tid != 0
+                                    && current_tid != kHomeScreenTid) {
+                                if (last_focused) {
+                                    /* (A) pdmqry missed the HOME press — apply HOME
+                                     * policy now, same as section (2)'s !new_focused
+                                     * branch would have done. */
+                                    g_saved_pause_state = g_should_pause;
+                                    const auto action = resolvePerTitlePolicy(kHomeScreenTid);
+                                    if (action == StartAction::ForcePause) {
+                                        if (fade_dir == FadeDir::Out) {
+                                            fade_pause       = true;
+                                            fade_hold_target = 0; // no hold on game exit
+                                        } else {
+                                            startFadeOut(kFadeSteps / 2, /*do_pause=*/true);
+                                        }
+                                    } else if (action == StartAction::ForcePlay) {
+                                        g_user_paused = false;
+                                        startFadeIn(kFadeSteps / 2);
+                                    } else {
+                                        /* DoNothing: keep music playing as-is.
+                                         * Reverse any in-progress title-launch FadeOut or
+                                         * silent hold — the music should not be paused when
+                                         * the user goes back to HOME. */
+                                        if (fade_dir == FadeDir::Out || fade_hold > 0) {
+                                            startFadeIn(kFadeSteps / 2);
+                                        }
+                                    }
+                                }
+                                /* (B) Game has exited — clear the stale TID so
+                                 * section (2) skips on this and all future ticks
+                                 * until a new game is launched. */
+                                current_tid    = 0;
+                                last_focused   = true;  // reset for next launch
+                                is_first_focus = true;  // next game gets full fade
+                                fade_pending_ticks  = 0; // game exited: cancel any pending fade
+                                fade_pending_action = StartAction::DoNothing;
+                                fade_hold        = 0;   // cancel any hold
+                                fade_hold_target = 0;
                             }
-                            /* DoNothing: leave g_should_pause as-is. */
                         }
-                        /* kHomeScreenTid: current_pid was already updated above.
-                         * Do NOT touch current_tid or last_focused — section (2)
-                         * must keep querying the game's TID so the HOME
-                         * out-of-focus event is detected and Play/Pause-on-Home
-                         * fires correctly. */
                     }
                 }
             }
@@ -1018,35 +1193,52 @@ namespace tune::impl {
                              *       The HOME-return branch below is the right
                              *       place to apply the correction.
                              *
-                             * Snapshot state and apply HOME's pause policy. */
+                             * Snapshot state and apply HOME's pause policy.
+                             *
+                             * KEY: if a title-launch FadeOut is currently in
+                             * progress (started by the new_focused branch below),
+                             * startFadeIn will REVERSE it from the current volume
+                             * position — no blocking, no hidsys.  The fade was
+                             * non-blocking so section (2) ran freely, caught the
+                             * OutOfFocus event, and is redirecting the ramp here. */
                             g_saved_pause_state = g_should_pause;
+                            /* Cancel any pending stability window — user is on
+                             * HOME regardless of what the window was waiting for. */
+                            fade_pending_ticks  = 0;
+                            fade_pending_action = StartAction::DoNothing;
                             const auto action = resolvePerTitlePolicy(kHomeScreenTid);
-                            if (action == StartAction::ForcePause)
-                                fadeOut(kFadeSteps / 2);
-                            else if (action == StartAction::ForcePlay) {
-                                /* Home Focus = Play should override a manual
-                                 * pause veto, just as Title/Custom Focus = Play
-                                 * does on title launch and HOME return. */
+                            if (action == StartAction::ForcePause) {
+                                if (fade_dir == FadeDir::Out) {
+                                    /* Already fading out — just ensure it pauses
+                                     * at the end (it may have been a no-pause
+                                     * fade from a previous edge case). */
+                                    fade_pause       = true;
+                                    fade_hold_target = 0; // HOME exit: no hold, pause immediately
+                                } else {
+                                    startFadeOut(kFadeSteps / 2, /*do_pause=*/true);
+                                }
+                            } else if (action == StartAction::ForcePlay) {
+                                /* Home Focus = Play: reverse any title-launch fade or
+                                 * silent hold.  startFadeIn handles all cases:
+                                 * FadeOut in progress → reverse it; hold active →
+                                 * cancel and fade in; already paused → unpause. */
                                 g_user_paused = false;
-                                fadeIn(kFadeSteps / 2);
+                                startFadeIn(kFadeSteps / 2);
+                            } else {
+                                /* DoNothing: keep music playing as-is.
+                                 * Reverse any in-progress title-launch FadeOut or
+                                 * silent hold via startFadeIn. */
+                                if (fade_dir == FadeDir::Out || fade_hold > 0) {
+                                    startFadeIn(kFadeSteps / 2);
+                                }
                             }
-                            /* DoNothing: leave playback state unchanged. */
                         } else {
-                            /* Returned to the same game from HOME.
+                            /* Returned to game from HOME, OR first InFocus
+                             * detected after a fresh game launch.
                              *
-                             * Only assert the per-title volume immediately if
-                             * sys-tune's configured level differs from the system
-                             * default of 1.0.  If it IS 1.0 (user hasn't set a
-                             * custom level), the system's own audproc reset to
-                             * 1.0 on resume is already correct — there's nothing
-                             * to fix, and aggressively writing 1.0 for 50 ms
-                             * would block UltraGB from re-applying its own level.
-                             *
-                             * When sys-tune DOES have a custom non-1.0 level:
-                             * applyTitleVolNow() fires first so the game audio
-                             * and music fade start simultaneously, then
-                             * s_transition_ticks sustains the correction for 50 ms
-                             * to catch the post-resume audproc reset. */
+                             * is_first_focus distinguishes the two cases so
+                             * we can use a full 1 s fade on first launch and
+                             * a faster 0.5 s fade on HOME returns. */
                             {
                                 const auto v_now = g_use_title_volume
                                     ? g_title_volume : g_default_title_volume;
@@ -1056,30 +1248,40 @@ namespace tune::impl {
                                 }
                             }
 
-                            /* Treated identically to a fresh title launch:
-                             *
-                             *   ForcePlay  → always play (clears manual-pause
-                             *                veto, mirrors first-launch behaviour).
-                             *   ForcePause → always pause (safe direction).
-                             *   DoNothing  → restore the state captured at
-                             *                focus-loss. */
+                            const bool was_first_focus = is_first_focus;
+                            const int fade_steps = is_first_focus
+                                ? kFadeSteps         // first launch: full 1 s fade
+                                : kFadeSteps / 2;    // HOME return: faster 0.5 s fade
+                            is_first_focus = false;
+
                             const auto action = resolvePerTitlePolicy(current_tid);
                             if (action == StartAction::ForcePlay) {
-                                /* ForcePlay on HOME return behaves the same as
-                                 * ForcePlay on first title launch: the user has
-                                 * explicitly configured this title to play, so
-                                 * that intent overrides any prior manual pause
-                                 * or startup-pause state.  Clear the user-pause
-                                 * veto so policyWrite() inside fadeIn() can
-                                 * take effect. */
                                 g_user_paused = false;
-                                fadeIn(kFadeSteps / 2);
+                                startFadeIn(fade_steps);
                             } else if (action == StartAction::ForcePause) {
-                                fadeOut(kFadeSteps / 2);
+                                if (was_first_focus) {
+                                    /* FIRST InFocus for this title with ForcePause.
+                                     *
+                                     * Start the fade immediately (no stability window)
+                                     * with a 1500 ms silent hold after it (hold_ticks=300).
+                                     * After the 1 s fade reaches silence, policyWrite(true)
+                                     * is deferred: volume stays 0, music still playing.
+                                     * kHomeScreenTid fires the instant HOME is pressed via
+                                     * pmdmnt — no pdmqry latency involved — so it handles
+                                     * HOME reliably at any point during the fade or hold.
+                                     * The hold just provides extra coverage for the rare case
+                                     * where pmdmnt fires kHomeScreenTid after the fade is
+                                     * already complete (e.g. very slow game loading). */
+                                    startFadeOut(fade_steps, /*do_pause=*/true, /*hold_ticks=*/600);
+                                } else {
+                                    /* HOME return → ForcePause: start immediately
+                                     * (game is already fully loaded, no hold needed). */
+                                    startFadeOut(fade_steps, /*do_pause=*/true);
+                                }
                             } else {
                                 // Restore snapshotted state; fade in if resuming play.
                                 if (!g_saved_pause_state && g_should_pause)
-                                    fadeIn(kFadeSteps / 2);
+                                    startFadeIn(fade_steps);
                                 else
                                     policyWrite(g_saved_pause_state);
                             }
@@ -1210,16 +1412,87 @@ namespace tune::impl {
                 }
             }
 
+            /* ---- Advance pending stability window ---- */
+            if (fade_pending_ticks > 0) {
+                if (--fade_pending_ticks == 0) {
+                    /* Window expired without OutOfFocus — game is genuinely
+                     * in focus.  Start the deferred fade now.  Section (2)
+                     * continues to run every 5 ms and can still reverse it
+                     * if the user presses HOME after the game has loaded. */
+                    if (fade_pending_action == StartAction::ForcePause) {
+                        startFadeOut(kFadeSteps, /*do_pause=*/true, /*hold_ticks=*/600);
+                    }
+                    fade_pending_action = StartAction::DoNothing;
+                }
+            }
+
+            /* ---- Advance non-blocking fade by one step ---- */
+            if (fade_dir == FadeDir::Out) {
+                audoutSetAudioOutVolume(fade_vol * float(fade_step) / fade_total);
+                if (fade_step > 0) {
+                    --fade_step;
+                } else {
+                    /* Fade-out complete. */
+                    fade_dir = FadeDir::None;
+                    if (fade_pause) {
+                        if (fade_hold_target > 0) {
+                            /* Enter the silent-hold phase: volume is already 0,
+                             * music is still technically playing (policyWrite(true)
+                             * has NOT been called yet).  Section (2) keeps running
+                             * every 5 ms.  If pdmqry delivers OutOfFocus during the
+                             * hold, startFadeIn cancels it and ramps straight back up
+                             * — no audible pause.  Only when the hold expires does
+                             * policyWrite(true) fire and the normal drain begin. */
+                            fade_hold        = fade_hold_target;
+                            fade_hold_target = 0;
+                        } else {
+                            policyWrite(true);
+                            /* Hold silence while already-queued audio buffers drain
+                             * (avoids a pop when music resumes).  Expressed in 5ms
+                             * ticks to match the active-fade sleep cadence. */
+                            fade_drain = (3 * AUDIO_LATENCY_MS + 4) / 5;
+                            /* Volume intentionally left at 0 during drain;
+                             * restored to fade_vol when drain expires below. */
+                        }
+                    } else {
+                        audoutSetAudioOutVolume(fade_vol); /* no-pause fade: restore */
+                    }
+                }
+            } else if (fade_dir == FadeDir::In) {
+                audoutSetAudioOutVolume(fade_vol * float(fade_step) / fade_total);
+                if (fade_step < fade_total) {
+                    ++fade_step;
+                } else {
+                    audoutSetAudioOutVolume(fade_vol); /* snap to exact target */
+                    fade_dir = FadeDir::None;
+                }
+            } else if (fade_hold > 0) {
+                /* Silent-hold phase: volume stays at 0, music is still playing.
+                 * Section (2) polls pdmqry every 5 ms throughout — if OutOfFocus
+                 * arrives, startFadeIn cancels the hold and ramps back up.
+                 * When the counter hits 0, commit the pause and start the drain. */
+                if (--fade_hold == 0) {
+                    policyWrite(true);
+                    fade_drain = (3 * AUDIO_LATENCY_MS + 4) / 5;
+                }
+            } else if (fade_drain > 0) {
+                if (--fade_drain == 0) {
+                    audoutSetAudioOutVolume(fade_vol); /* restore after drain */
+                }
+            }
+
             // Three-tier sleep cadence:
+            //   5 ms  — active fade: one step per tick, matches old blocking rate
             //   1 ms  — tight post-focus-flip window: catch audproc resets within 1 ms
             //  10 ms  — active write window (retry or sustained transition ticks)
             //  50 ms  — true steady state: no transitions, no retries pending.
             //            Title changes and HOME events are unaffected — they are
             //            detected within 50 ms at most, which is imperceptible.
-            const u64 sleep_ns = s_in_vol_transition      ? 1'000'000ULL
+            const u64 sleep_ns = fadeActive()              ? kFadeStepIntervalNs
+                               : s_in_vol_transition       ? 1'000'000ULL
                                : (s_retry_ticks > 0 ||
-                                  s_transition_ticks > 0) ? 10'000'000ULL
-                                                          : 50'000'000ULL;
+                                  s_transition_ticks > 0)  ? 10'000'000ULL
+                                                           : 50'000'000ULL;
             svcSleepThread(sleep_ns);
         }
     }
