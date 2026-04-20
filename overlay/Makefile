@@ -73,7 +73,7 @@ endif
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-CFLAGS := -g -Wall -O2 -ffunction-sections -fdata-sections -flto \
+CFLAGS := -g -Wall -Os -ffunction-sections -fdata-sections -flto \
           -fuse-linker-plugin -fomit-frame-pointer -finline-small-functions \
           -fno-strict-aliasing -frename-registers -falign-functions=16 \
           $(ARCH) $(DEFINES)
