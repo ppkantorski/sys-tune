@@ -1,6 +1,6 @@
 {
     "name"  : "sys-tune",
-    "version": "2.1.0+r1",
+    "version": "2.1.0+r2",
     "tid"   : "4200000000000000",
     "requires_reboot": false
 }
