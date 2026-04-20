@@ -728,7 +728,7 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
             const s32 art_x = this->getX() + 15 + (avail_w - art_sz) / 2;
 
             if (m_art_valid) {
-                renderer->drawBitmapRGBA4444(art_x, this->getY() + 6,
+                renderer->drawBitmapRGBA4444(art_x, this->getY() + 11,
                                              art_sz, art_sz, m_art_rgba4444.data(),
                                              tsl::gfx::Renderer::s_opacity, false);
             }
@@ -737,7 +737,7 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
             else {
                 /* 4-px white border drawn inside the art rectangle. */
                 constexpr s32 BORDER = 4;
-                const s32 art_y = this->getY() + 6;
+                const s32 art_y = this->getY() + 11;
 
                 // black fill FIRST (so border stays visible on top)
                 renderer->drawRectAdaptive(art_x, art_y, art_sz, art_sz, a(0xA000));
@@ -777,7 +777,7 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
         }
     }
 
-    const s32 title_y = this->getY() + art_sz + 4 + 20 + 10 + 6;
+    const s32 title_y = this->getY() + art_sz + 4 + 20 + 10 + 11;
 
     if (this->m_truncated) {
         renderer->enableScissoring(this->getX() + 15, title_y - 22, avail_w, 28);
@@ -847,7 +847,7 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
     /* --- Seek bar --- */
     const s32 bar_off = art_off + 10;
     const s32 bar_x   = this->getX() + 15;
-    const s32 bar_y   = this->getY() + bar_off + tsl::style::ListItemDefaultHeight + 2;
+    const s32 bar_y   = this->getY() + bar_off + tsl::style::ListItemDefaultHeight + 5;
     const s32 bar_len = this->getWidth() - 30;
 
     renderer->drawRect(bar_x, bar_y, bar_len, 3, a(0xffff));
@@ -1453,9 +1453,9 @@ void StatusBar::onHeld(u64 keysHeld) {
 
     /* A tap on a physical button typically lasts 50-80 ms (3-5 frames at 60 fps).
        400 ms is clearly "intentional hold" and will never fire on a quick press. */
-    constexpr u64 HOLD_DELAY_NS  = 400'000'000ULL;  /* 400 ms initial delay       */
-    constexpr u64 BTN_REPEAT_NS  = 100'000'000ULL;  /* 100 ms between button steps */
-    constexpr u64 SEEK_REPEAT_NS =  80'000'000ULL;  /* ~12 ticks/s seek scrub rate */
+    static constexpr u64 HOLD_DELAY_NS  = 400'000'000ULL;  /* 400 ms initial delay       */
+    static constexpr u64 BTN_REPEAT_NS  = 100'000'000ULL;  /* 100 ms between button steps */
+    static constexpr u64 SEEK_REPEAT_NS =  80'000'000ULL;  /* ~12 ticks/s seek scrub rate */
 
     if (now - m_hold_start_ns < HOLD_DELAY_NS) return;
 
@@ -1489,7 +1489,7 @@ void StatusBar::onHeld(u64 keysHeld) {
 
         /* Fire haptic every 2% of track progress — feels like physical notches,
            scales naturally with both slow precise and fast accelerated scrubbing. */
-        constexpr float kFeedbackInterval = 0.02f;
+        static constexpr float kFeedbackInterval = 0.02f;
         if (m_seek_feedback_last_pct < 0.f ||
             std::abs(m_seek_percentage - m_seek_feedback_last_pct) >= kFeedbackInterval) {
             triggerNavigationFeedback();
