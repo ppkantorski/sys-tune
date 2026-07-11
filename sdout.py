@@ -11,9 +11,11 @@
 #     atmosphere/contents/4200000000000000/exefs.nsp
 #     atmosphere/contents/4200000000000000/toolbox.json
 #     atmosphere/contents/4200000000000000/flags/          (empty)
+#     config/sys-tune/lang/<code>.json                     (translations)
 #
 # Source layout expected (relative to this script):
 #     overlay/sys-tune-overlay.ovl
+#     overlay/lang/*.json
 #     sys-tune/sys-tune.nsp
 #     sys-tune/toolbox.json
 #
@@ -60,12 +62,21 @@ def main():
     ovl_source     = script_dir / "overlay" / "sys-tune-overlay.ovl"
     nsp_source     = script_dir / "sys-tune" / "sys-tune.nsp"
     toolbox_source = script_dir / "sys-tune" / "toolbox.json"
+    lang_source    = script_dir / "overlay" / "lang"
 
     # Validate sources before doing anything
     missing = [p for p in (ovl_source, nsp_source, toolbox_source) if not p.exists()]
     if missing:
         for p in missing:
             print(f"✗ Missing source file: {p}")
+        raise SystemExit(1)
+
+    # Language files are shipped to /config/sys-tune/lang/ (the overlay's
+    # UI_OVERRIDE_PATH), where parseOverlaySettings picks up <lang>.json.
+    lang_files = sorted(lang_source.glob("*.json")) if lang_source.is_dir() else []
+    lang_files = [p for p in lang_files if not p.name.startswith('._')]
+    if not lang_files:
+        print(f"✗ No language files found in {lang_source}")
         raise SystemExit(1)
 
     # ── Clean up previous build ───────────────────────────────────────────────
@@ -82,8 +93,9 @@ def main():
     contents_dir = sdout_dir / "atmosphere" / "contents" / TITLE_ID
     flags_dir    = contents_dir / "flags"
     overlays_dir = sdout_dir / "switch" / ".overlays"
+    lang_dir     = sdout_dir / "config" / "sys-tune" / "lang"
 
-    for folder in (contents_dir, flags_dir, overlays_dir):
+    for folder in (contents_dir, flags_dir, overlays_dir, lang_dir):
         folder.mkdir(parents=True, exist_ok=True)
         print(f"  Created {folder.relative_to(sdout_dir)}")
 
@@ -98,6 +110,10 @@ def main():
 
     shutil.copy2(toolbox_source, contents_dir / "toolbox.json")
     print(f"  Copied toolbox.json → atmosphere/contents/{TITLE_ID}/")
+
+    for lf in lang_files:
+        shutil.copy2(lf, lang_dir / lf.name)
+    print(f"  Copied {len(lang_files)} language file(s) → config/sys-tune/lang/")
 
     # flags/ is intentionally left empty
     print(f"  Created empty flags/ directory")
