@@ -17,23 +17,6 @@ class SysTuneOverlay final : public tsl::Overlay {
 
   public:
     void initServices() override {
-        // Check free system RAM before attempting to launch the sysmodule.
-        // Uses the same svcGetSystemInfo calls as drawMemoryWidget in gui_main.cpp:
-        //   type 0, subtype 2 = total system RAM
-        //   type 1, subtype 2 = used  system RAM
-        {
-            u64 RAM_Total_system_u = 0, RAM_Used_system_u = 0;
-            svcGetSystemInfo(&RAM_Total_system_u, 0, INVALID_HANDLE, 2);
-            svcGetSystemInfo(&RAM_Used_system_u,  1, INVALID_HANDLE, 2);
-            const u64 freeRamBytes = RAM_Total_system_u - RAM_Used_system_u;
-            constexpr u64 kMinRequired = 5872026ULL; // 5.6 MB
-            if (freeRamBytes < kMinRequired) {
-                this->msg = "Not enough memory.";
-                return;
-            }
-        }
-
-
         if (R_FAILED(pm::Initialize())) {
             this->msg  = "Failed pm::Initialize()";
             return;
@@ -43,6 +26,26 @@ class SysTuneOverlay final : public tsl::Overlay {
         // not found can happen if the service isn't started
         // connection refused can happen is the service was terminated by pmshell
         if (R_VALUE(rc) == KERNELRESULT(NotFound) || R_VALUE(rc) == KERNELRESULT(ConnectionRefused)) {
+            // The sysmodule isn't running, so we're about to launch it — check
+            // free system RAM first. This check deliberately lives inside the
+            // "service not found" path: if the module is already up and playing
+            // music, re-entering the overlay must never fail on memory it
+            // doesn't need to allocate.
+            // Uses the same svcGetSystemInfo calls as drawMemoryWidget in gui_main.cpp:
+            //   type 0, subtype 2 = total system RAM
+            //   type 1, subtype 2 = used  system RAM
+            {
+                u64 RAM_Total_system_u = 0, RAM_Used_system_u = 0;
+                svcGetSystemInfo(&RAM_Total_system_u, 0, INVALID_HANDLE, 2);
+                svcGetSystemInfo(&RAM_Used_system_u,  1, INVALID_HANDLE, 2);
+                const u64 freeRamBytes = RAM_Total_system_u - RAM_Used_system_u;
+                constexpr u64 kMinRequired = 5872026ULL; // 5.6 MB
+                if (freeRamBytes < kMinRequired) {
+                    this->msg = "Not enough memory.";
+                    return;
+                }
+            }
+
             u64 pid = 0;
             const NcmProgramLocation programLocation{
                 .program_id = 0x4200000000000000,

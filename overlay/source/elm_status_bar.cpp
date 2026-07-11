@@ -869,7 +869,16 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
             : lerpColor(tsl::highlightColor1, tsl::highlightColor2, prog);
         /* Radius = thumb radius (7) + 4 px border. No black fill — highlight
            peeks out 4 px behind the white thumb circle. */
-        renderer->drawCircle(thumb_x, bar_y + 2, 7 + 4, true, a(hcol));
+        if (ult::useSwitch2Style) {
+            /* Switch 2 style: sample the S2 cursor wheel per-pixel for the
+               ring, same as the trackbar's circular slider handle. R-held
+               cross-fades to the alternate (warm) palette via the shared
+               ~300ms blend; the wheel only reads the colour's alpha. */
+            const tsl::Switch2Wheel w2 = this->buildSwitch2Wheel(m_r_held, S2_WHEEL_SLOT_HANDLE);
+            renderer->drawCircle(thumb_x, bar_y + 2, 7 + 4, true, a(hcol), &w2);
+        } else {
+            renderer->drawCircle(thumb_x, bar_y + 2, 7 + 4, true, a(hcol));
+        }
     }
 
     renderer->drawCircle(thumb_x, bar_y + 2, 7, true, a(0xffff));
@@ -953,7 +962,26 @@ void StatusBar::draw(tsl::gfx::Renderer *renderer) {
             innerColor = animColor;
         }
 
-        renderer->drawCircle(cx, cy, btn_r + 4, true, a(highlightColor));
+        if (ult::useSwitch2Style) {
+            /* Switch 2 style: draw the circular cursor ring with the S2 colour
+               wheel (same sampler the trackbar slider handle uses). A click
+               pulses the whole wheel to the alternate palette and eases back
+               (mirroring drawClickAnimation's clickBlend); otherwise R-held
+               cross-fades to it via the shared slot state. The wheel supplies
+               the RGB per pixel — highlightColor only contributes alpha. */
+            tsl::Switch2Wheel w2;
+            if (this->m_clickAnimationProgress > 0) {
+                const float clickBlend = std::max(0.0f, std::min(1.0f,
+                    static_cast<float>(this->m_clickAnimationProgress)
+                        / static_cast<float>(tsl::style::ListItemHighlightLength)));
+                w2 = tsl::blendSwitch2Wheels(tsl::makeSwitch2Wheel(), tsl::makeSwitch2WheelAlt(), clickBlend);
+            } else {
+                w2 = this->buildSwitch2Wheel(m_r_held, S2_WHEEL_SLOT_HANDLE);
+            }
+            renderer->drawCircle(cx, cy, btn_r + 4, true, a(highlightColor), &w2);
+        } else {
+            renderer->drawCircle(cx, cy, btn_r + 4, true, a(highlightColor));
+        }
         renderer->drawCircle(cx, cy, btn_r,     true, a(innerColor));
     }
 
