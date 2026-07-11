@@ -89,15 +89,36 @@ public:
         static constexpr float buttonStartX = 30.f;
         const float buttonY = static_cast<float>(tsl::cfg::FramebufferHeight - 73 + 1);
 
+        // Translate the page-left/page-right names individually, up front \u2014
+        // same as tsl::elm::OverlayFrame. Once concatenated with icons/gaps
+        // into the composed footer string below, that composite can never
+        // match a translation cache entry as a whole, so the lookup has to
+        // happen here on each raw piece before it's merged in.
+        std::string translatedPageLeftName  = m_pageLeftName;
+        std::string translatedPageRightName = m_pageRightName;
+        if (!m_pageLeftName.empty() || !m_pageRightName.empty()) {
+            std::shared_lock<std::shared_mutex> pageNameReadLock(tsl::gfx::s_translationCacheMutex);
+            if (!m_pageLeftName.empty()) {
+                const auto leftIt = ult::translationCache.find(m_pageLeftName);
+                if (leftIt != ult::translationCache.end())
+                    translatedPageLeftName = leftIt->second;
+            }
+            if (!m_pageRightName.empty()) {
+                const auto rightIt = ult::translationCache.find(m_pageRightName);
+                if (rightIt != ult::translationCache.end())
+                    translatedPageRightName = rightIt->second;
+            }
+        }
+
         // --- Page navigation ---
         const bool hasNextPage = !m_pageLeftName.empty() || !m_pageRightName.empty();
         if (hasNextPage != ult::hasNextPageButton.load(std::memory_order_acquire))
             ult::hasNextPageButton.store(hasNextPage, std::memory_order_release);
 
         if (hasNextPage) {
-            const std::string pageLabel = !m_pageLeftName.empty()
-                ? ("\uE0ED" + ult::GAP_2 + m_pageLeftName)
-                : ("\uE0EE" + ult::GAP_2 + m_pageRightName);
+            const std::string pageLabel = !translatedPageLeftName.empty()
+                ? ("\uE0ED" + ult::GAP_2 + translatedPageLeftName)
+                : ("\uE0EE" + ult::GAP_2 + translatedPageRightName);
 
             const float _nextPageWidth = renderer->getTextDimensions(pageLabel, false, 23).first + gapWidth;
             updateAtomic(ult::nextPageWidth, _nextPageWidth);
@@ -120,8 +141,8 @@ public:
         const std::string currentBottomLine =
             "\uE0E1" + ult::GAP_2 + ult::BACK  + ult::GAP_1 +
             "\uE0E0" + ult::GAP_2 + ult::OK    + ult::GAP_1 +
-            (!m_pageLeftName.empty()  ? "\uE0ED" + ult::GAP_2 + m_pageLeftName  + ult::GAP_1 :
-             !m_pageRightName.empty() ? "\uE0EE" + ult::GAP_2 + m_pageRightName + ult::GAP_1 : "");
+            (!translatedPageLeftName.empty()  ? "\uE0ED" + ult::GAP_2 + translatedPageLeftName  + ult::GAP_1 :
+             !translatedPageRightName.empty() ? "\uE0EE" + ult::GAP_2 + translatedPageRightName + ult::GAP_1 : "");
 
         renderer->drawStringWithColoredSections(currentBottomLine, false, tsl::s_footerSpecialChars,
             buttonStartX, 693, 23, tsl::bottomTextColor, tsl::buttonColor);
